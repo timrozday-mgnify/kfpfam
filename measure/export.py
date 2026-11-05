@@ -22,8 +22,8 @@ FRACS = [1.0, 0.5, 0.25, 0.1]
 
 
 def thin_background(src, groups_src, dest, groups_dest, bar=18.0):
-    """Keep seeds on diagonals of at least `bar` bits: lower bars pass thousands of models and
-    double the download. Layout is scan's write_rows."""
+    """Keep anchors, and seeds on diagonals of at least `bar` bits: lower bars pass thousands of
+    models and double the download. Layout is scan's write_rows."""
     b = gzip.open(src).read()
     ng, nr = np.frombuffer(b[:8], dtype=np.uint32)
     offs = np.frombuffer(b, np.uint32, ng + 1, 8)
@@ -36,7 +36,7 @@ def thin_background(src, groups_src, dest, groups_dest, bar=18.0):
     for name in ("j", "score", "diag", "rank_lr", "rank_p", "logp", "info", "word"):
         cols[name] = np.frombuffer(b, np.uint8, nr, p)
         p += int(nr)
-    keep = cols["diag"] >= int(bar * 2)
+    keep = (cols["diag"] >= int(bar * 2)) | (cols["word"] & 2 > 0)
     group = np.repeat(np.arange(ng), np.diff(offs))[keep]
     kept, inv = np.unique(group, return_inverse=True)
     new = np.zeros(len(kept) + 1, np.uint32)
@@ -52,6 +52,19 @@ def thin_background(src, groups_src, dest, groups_dest, bar=18.0):
     pairs = np.frombuffer(gzip.open(groups_src).read(), np.uint16).reshape(-1, 2)
     with gzip.open(groups_dest, "wb", compresslevel=9) as f:
         f.write(pairs[kept].tobytes())
+
+
+def profile_chunks(prep, out, chunks=200):
+    """Log-odds per model in quarter bits, in pieces fetched on demand by the family view."""
+    offs = np.fromfile(prep / "offs.u32", dtype=np.uint32)
+    lo = np.memmap(prep / "profile.f32", dtype=np.float32, mode="r").reshape(-1, 21)[:, :20]
+    (out / "profile").mkdir(exist_ok=True)
+    n = len(offs) - 1
+    for c in range(chunks):
+        a, b = c * n // chunks, (c + 1) * n // chunks
+        q = np.clip(np.round(lo[offs[a]:offs[b]] * 4), -127, 127).astype(np.int8)
+        with gzip.open(out / "profile" / f"{c}.bin.gz", "wb", compresslevel=9) as f:
+            f.write(q.tobytes())
 
 
 def main():
@@ -120,8 +133,11 @@ def main():
         "readBestModel": [byread.get(str(i), (0, 0))[1] for i in range(reads)],
         "shapes": {k: list(v) for k, v in SHAPES.items()},
         "fracs": FRACS,
+        "anchorFloor": {"k4": 9, "k5": 9.5, "k6": 10.5, "k7": 11.5, "s5": 9.5, "s6": 10.5, "p33": 10.5},
+        "maxWindow": 6,
     }
     (out / "meta.json").write_text(json.dumps(meta))
+    profile_chunks(prep, out)
     print(sum(p.stat().st_size for p in out.iterdir()) / 1e6, "MB")
 
 

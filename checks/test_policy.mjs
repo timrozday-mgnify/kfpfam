@@ -17,4 +17,9 @@ await check('k5', 10, 22, { recall: 0.923, candidates: 8.3, entries: 4.7e8 });
 await check('k5', 8, 22, { recall: 0.991, candidates: 13.5, entries: 3.2e9 });
 await check('k4', 8, 22, { recall: 0.955, candidates: 10.5, entries: 1.14e8 });
 await check('k6', 12, 22, { recall: 0.877, candidates: 6.5, entries: 1.9e9 });
+// Anchors: a window of ±3 reproduces the Python scan's two-hit recall, k5 T8 at GA.
+const d = { ...common, ...(await loadShape('k5', common)), meta: common.meta };
+const a = evaluate({ shape: 'k5', method: 'lr', value: 8, target: 'fixed', rule: 'anchors', anchorN: 2, anchorWindow: 3, anchorSum: 0, bar: 22, truth: 'ga', set: 'reads' }, d);
+console.log('anchors k5 T8 ±3 recall', a.rec.recall.toFixed(3));
+assert(Math.abs(a.rec.recall - 0.964) < 0.03, 'anchors');
 console.log('ok');

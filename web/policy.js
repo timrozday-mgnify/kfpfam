@@ -135,7 +135,7 @@ export function indexCost(policy, models, tab, T, offsets) {
 }
 
 /** Does this seed belong to the policy's k-mer set? */
-function selector(policy, rows, modelOfGroup, T, offsets) {
+export function selector(policy, rows, modelOfGroup, T, offsets) {
   const keepInfo = Math.floor(255 * (1 - (policy.windowKeep ?? 1)));
   const sparsity = policy.sparsity || 1;
   const hashMax = 256 / sparsity;
@@ -156,49 +156,85 @@ function selector(policy, rows, modelOfGroup, T, offsets) {
         return (hash[r] & 255) / 256 < 1 - (1 - p) ** n;
       };
     case 'words':
-      return (r) => pre(r) && word[r] === 1;
+      return (r) => pre(r) && (word[r] & 1) === 1;
     default:
       throw new Error(policy.method);
   }
 }
 
+const usesAnchors = (rule) => rule === 'anchors' || rule === 'either' || rule === 'both';
+const usesDiagonal = (rule) => rule === 'diag' || rule === 'either' || rule === 'both';
+
 /**
- * Per group: best diagonal among selected seeds (0 if none), and whether two non-overlapping
- * selected seeds share a diagonal.
+ * Pseudo-alignment of a read and model from their anchors: the best-scoring chain of at least n
+ * selected seeds, in read order, not overlapping, each within `window` diagonals of the last.
+ * No hashing of distances, so an indel between anchors costs nothing. Returns the chain's summed
+ * seed score, or 0.
  */
+function chainScore(idx, rows, span, n, window, dp) {
+  const { j, col, score } = rows;
+  idx.sort((a, b) => j[a] - j[b]);
+  const len = idx.length;
+  if (dp.length < len * 3) dp.length = len * 3;
+  let best = 0;
+  for (let i = 0; i < len; i++) {
+    const r = idx[i];
+    const s = score[r] / 4;
+    const d = col[r] - j[r];
+    dp[i * 3] = s;
+    dp[i * 3 + 1] = 0;
+    dp[i * 3 + 2] = 0;
+    for (let p = 0; p < i; p++) {
+      const q = idx[p];
+      if (j[r] - j[q] < span) continue;
+      const delta = d - (col[q] - j[q]);
+      if (delta > window || delta < -window) continue;
+      if (dp[p * 3] + s > dp[i * 3 + 1]) dp[i * 3 + 1] = dp[p * 3] + s;
+      if (dp[p * 3 + 1] > 0 && dp[p * 3 + 1] + s > dp[i * 3 + 2]) dp[i * 3 + 2] = dp[p * 3 + 1] + s;
+    }
+    const v = n === 2 ? Math.max(dp[i * 3 + 1], dp[i * 3 + 2]) : dp[i * 3 + 2];
+    if (v > best) best = v;
+  }
+  return best;
+}
+
+/** Per group: best diagonal among selected seeds (0 if none), and the best anchor chain. */
 export function groupEvidence(policy, rows, modelOfGroup, T, offsets, span) {
   const select = selector(policy, rows, modelOfGroup, T, offsets);
   const best = new Float32Array(rows.groups);
-  const two = new Uint8Array(rows.groups);
-  const { offs, col, j, diag } = rows;
-  const firstOnDiag = new Map();
-  const needTwo = policy.rule === 'two';
+  const chain = new Float32Array(rows.groups);
+  const { offs, diag } = rows;
+  const needChain = usesAnchors(policy.rule);
+  const n = policy.anchorN || 2;
+  const window = policy.anchorWindow ?? 3;
+  const idx = [];
+  const dp = [];
   for (let g = 0; g < rows.groups; g++) {
     const m = modelOfGroup[g];
-    if (needTwo) firstOnDiag.clear();
+    idx.length = 0;
     for (let r = offs[g]; r < offs[g + 1]; r++) {
       if (!select(r, m)) continue;
       const d = diag[r] / 2;
       if (d > best[g]) best[g] = d;
-      if (needTwo) {
-        const key = col[r] - j[r];
-        const first = firstOnDiag.get(key);
-        if (first === undefined) firstOnDiag.set(key, j[r]);
-        else if (Math.abs(j[r] - first) >= span) two[g] = 1;
-      }
+      if (needChain) idx.push(r);
     }
+    if (idx.length >= n) chain[g] = chainScore(idx, rows, span, n, window, dp);
   }
-  return { best, two };
+  return { best, chain };
 }
 
 /** Whether a group passes the read hit rule. */
 export function passes(policy, ev, g, m, bars, bestAny, bestModel, models) {
   const seeded = ev.best[g] > 0;
   if (!seeded) return false;
+  const diagonal = ev.best[g] >= bars[m];
+  const anchors = ev.chain[g] > 0 && ev.chain[g] >= (policy.anchorSum || 0) + (bars[m] - policy.bar);
   let ok;
   if (policy.rule === 'seed') ok = true;
-  else if (policy.rule === 'two') ok = ev.two[g] === 1;
-  else ok = ev.best[g] >= bars[m];
+  else if (policy.rule === 'anchors') ok = anchors;
+  else if (policy.rule === 'either') ok = diagonal || anchors;
+  else if (policy.rule === 'both') ok = diagonal && anchors;
+  else ok = diagonal;
   if (ok && policy.rankBits != null && bestAny) {
     const within = ev.best[g] >= bestAny[g] - policy.rankBits;
     const sameClan = policy.clanAware && models.clan[m] && models.clan[m] === models.clan[bestModel[g]];
@@ -294,7 +330,7 @@ export function evaluate(policy, d) {
 /** Recall and candidates at other bars, from the same evidence (no re-selection). */
 export function barSweep(res, policy, d, barsList) {
   return barsList.map((bar) => {
-    const p = { ...policy, rule: 'diag', bar };
+    const p = { ...policy, rule: usesDiagonal(policy.rule) ? policy.rule : 'diag', bar };
     const bars = barsFor(p, res.barOffsets);
     const rec = recall(p, d.pairs, d.truth, res.truthEv, bars, d.models);
     const cand = candidates(p, d.bg, res.bgEv, bars, res.cost, res.wRead, d.models);

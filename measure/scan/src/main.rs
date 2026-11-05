@@ -286,6 +286,11 @@ fn tables(pf: &Pfam, out: &str) {
     }
 }
 
+/// Background seeds on weak diagonals are kept only as anchors: at least this score, with a
+/// non-overlapping partner within MAX_WINDOW diagonals, so window rules can be evaluated later.
+const ANCHOR_FLOOR: [f32; 7] = [9.0, 9.5, 10.5, 11.5, 9.5, 10.5, 10.5];
+const MAX_WINDOW: i64 = 6;
+
 /// One seed in a sequence (see the module docs); packed for the browser later.
 #[derive(Clone)]
 struct Row {
@@ -300,6 +305,7 @@ struct Row {
     logp: f32,
     info: f32,
     word: bool,
+    anchor: bool,
 }
 #[inline]
 fn kadane(v: &[f32]) -> f32 {
@@ -374,7 +380,7 @@ fn fill_ranks(pf: &Pfam, a: usize, r: &mut Row, shape: &[usize], f: &[u8], memo:
 /// All diagonals of one model against a sequence. Seeds are recorded where the diagonal scores
 /// at least `bar`; returns the best diagonal score.
 #[allow(clippy::too_many_arguments)]
-fn scan_model(pf: &Pfam, m: usize, f: &[u8], si: usize, bar: f32, group: u32, out: &mut Vec<Row>, info: Option<&[u8]>, buf: &mut Vec<f32>) -> f32 {
+fn scan_model(pf: &Pfam, m: usize, f: &[u8], si: usize, bar: f32, group: u32, out: &mut Vec<Row>, info: Option<&[u8]>, buf: &mut Vec<f32>, anchors: bool) -> f32 {
     let (a, b) = pf.range(m);
     let big = b - a;
     let l = f.len();
@@ -382,6 +388,9 @@ fn scan_model(pf: &Pfam, m: usize, f: &[u8], si: usize, bar: f32, group: u32, ou
     let span = shape.last().unwrap() + 1;
     let mut best = 0.0f32;
     let mut memo = HashMap::new();
+    let floor = ANCHOR_FLOOR[si];
+    // (diagonal, read position, score, diagonal score, emitted already)
+    let mut anchor_list: Vec<(i64, usize, f32, f32, bool)> = vec![];
     for d in (1 - l as i64)..(big as i64) {
         let x0 = (-d).max(0) as usize;
         let x1 = l.min((big as i64 - d) as usize);
@@ -397,7 +406,21 @@ fn scan_model(pf: &Pfam, m: usize, f: &[u8], si: usize, bar: f32, group: u32, ou
         if ds > best {
             best = ds;
         }
-        if ds < bar || buf.len() < span {
+        if buf.len() < span {
+            continue;
+        }
+        if ds < bar {
+            if anchors {
+                for p in 0..=(buf.len() - span) {
+                    let mut s = 0.0;
+                    for &o in shape {
+                        s += buf[p + o];
+                    }
+                    if s >= floor {
+                        anchor_list.push((d, x0 + p, s, ds, false));
+                    }
+                }
+            }
             continue;
         }
         for p in 0..=(buf.len() - span) {
@@ -409,11 +432,30 @@ fn scan_model(pf: &Pfam, m: usize, f: &[u8], si: usize, bar: f32, group: u32, ou
                 let j = x0 + p;
                 let col = (d + j as i64) as usize;
                 let Some(kmer) = kmer_of(f, j, shape) else { continue };
-                let mut r = Row { group, col: col as u16, j: j as u8, score: s, diag: ds, kmer, rank_lr: 0.0, rank_p: 0.0, logp: 0.0, info: info.map_or(0.0, |v| v[col] as f32), word: false };
+                let mut r = Row { group, col: col as u16, j: j as u8, score: s, diag: ds, kmer, rank_lr: 0.0, rank_p: 0.0, logp: 0.0, info: info.map_or(0.0, |v| v[col] as f32), word: false, anchor: false };
                 fill_ranks(pf, a, &mut r, shape, f, &mut memo);
                 out.push(r);
+                if anchors && s >= floor {
+                    anchor_list.push((d, j, s, ds, true));
+                }
             }
         }
+    }
+    // Weak-diagonal anchors with a partner in the window join the record.
+    for i in 0..anchor_list.len() {
+        let (d, j, s, ds, emitted) = anchor_list[i];
+        if emitted {
+            continue;
+        }
+        let partner = anchor_list.iter().any(|&(d2, j2, ..)| (d2 - d).abs() <= MAX_WINDOW && j2.abs_diff(j) >= span);
+        if !partner {
+            continue;
+        }
+        let col = (d + j as i64) as usize;
+        let Some(kmer) = kmer_of(f, j, shape) else { continue };
+        let mut r = Row { group, col: col as u16, j: j as u8, score: s, diag: ds, kmer, rank_lr: 0.0, rank_p: 0.0, logp: 0.0, info: info.map_or(0.0, |v| v[col] as f32), word: false, anchor: true };
+        fill_ranks(pf, a, &mut r, shape, f, &mut memo);
+        out.push(r);
     }
     best
 }
@@ -487,12 +529,13 @@ fn word_row(pf: &Pfam, m: usize, f: &[u8], j: usize, shape: &[usize], kmer: u64,
     if ds < bar {
         return None;
     }
-    let mut r = Row { group, col: bc as u16, j: j as u8, score: bs, diag: ds, kmer, rank_lr: 0., rank_p: 0., logp: 0., info: info[bc] as f32, word: true };
+    let mut r = Row { group, col: bc as u16, j: j as u8, score: bs, diag: ds, kmer, rank_lr: 0., rank_p: 0., logp: 0., info: info[bc] as f32, word: true, anchor: false };
     fill_ranks(pf, a, &mut r, shape, f, memo);
     Some(r)
 }
 /// groups u32, rows u32, group offsets u32[g+1]; columns col u16, hash u16, j, score(0.25), diag(0.5),
-/// rankLR, rankP (log2*8), logp (*4), info, word: one byte each.
+/// rankLR, rankP (log2*8), logp (*4), info, flags (1: in the seed alignment; 2: kept as an anchor on a
+/// weak diagonal): one byte each.
 fn write_rows(path: &str, rows: &mut [Row], groups: usize) {
     rows.sort_by_key(|r| (r.group, r.col, r.j));
     let mut offs = vec![0u32; groups + 1];
@@ -515,7 +558,7 @@ fn write_rows(path: &str, rows: &mut [Row], groups: usize) {
     rows.iter().for_each(|r| b.push(((r.rank_p as f64).log2() * 8.0).round().clamp(0.0, 255.0) as u8));
     rows.iter().for_each(|r| b.push((r.logp * 4.0).round().clamp(0.0, 255.0) as u8));
     rows.iter().for_each(|r| b.push(r.info as u8));
-    rows.iter().for_each(|r| b.push(r.word as u8));
+    rows.iter().for_each(|r| b.push(r.word as u8 | (r.anchor as u8) << 1));
     write_gz(path, &b);
 }
 fn read_tsv(p: &str) -> Vec<Vec<String>> {
@@ -545,7 +588,7 @@ fn truth(pf: &Pfam, dir: &str, input: &str, out: &str) {
                 for &i in idx {
                     let f = &pairs[i].0;
                     let before = out.len();
-                    scan_model(pf, *m, f, si, -1.0, i as u32, &mut out, if info.is_empty() { None } else { Some(&info) }, &mut buf);
+                    scan_model(pf, *m, f, si, -1.0, i as u32, &mut out, if info.is_empty() { None } else { Some(&info) }, &mut buf, false);
                     // Words below the recording bar are added; recorded ones are flagged.
                     let mut seen = HashSet::new();
                     for r in out[before..].iter_mut() {
@@ -600,7 +643,7 @@ fn background(pf: &Pfam, dir: &str, input: &str, bar: f32, out: &str) {
                 for (read, f) in &orfs {
                     let g = (*read as u64 * 40000 + m as u64) as u32;
                     let before = rows.len();
-                    scan_model(pf, m, f, si, bar, g, &mut rows, if info.is_empty() { None } else { Some(&info) }, &mut buf);
+                    scan_model(pf, m, f, si, bar, g, &mut rows, if info.is_empty() { None } else { Some(&info) }, &mut buf, true);
                     let mut seen = HashSet::new();
                     for r in rows[before..].iter_mut() {
                         if set.contains(&r.kmer) {
@@ -670,7 +713,7 @@ fn best(pf: &Pfam, input: &str, out: &str) {
             let (mut bs, mut bm) = (0.0f32, 0usize);
             let mut unused = vec![];
             for m in 0..pf.models() {
-                let s = scan_model(pf, m, f, 0, f32::MAX, 0, &mut unused, None, &mut buf);
+                let s = scan_model(pf, m, f, 0, f32::MAX, 0, &mut unused, None, &mut buf, false);
                 if s > bs {
                     bs = s;
                     bm = m;

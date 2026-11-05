@@ -2,6 +2,7 @@
 /* global Plotly */
 import { barSweep, estimateMs, evaluate, FEATURES, N_GRID, parseRows } from './policy.js';
 import { loadCommon, loadShape } from './load.js';
+import { drawFamily, setupFamily } from './family.js';
 
 const el = (id) => /** @type {HTMLInputElement} */ (document.getElementById(id));
 const compact = (x) => (x >= 1e4 || (x > 0 && x < 0.01) ? x.toExponential(1).replace('e+', 'e') : x >= 100 ? x.toFixed(0) : x.toPrecision(3));
@@ -27,9 +28,11 @@ const PRESETS = {
   'Same emission coverage': { shape: 'k5', method: 'lr', target: 'coverage', coverage: 0.05, bar: 22, rule: 'diag' },
   'Sampled, 300 per window': { shape: 'k5', method: 'sample', value: 300, bar: 22, rule: 'diag' },
   'Words in seed alignment': { shape: 'k5', method: 'words', bar: 22, rule: 'diag' },
-  'Two-hit': { shape: 'k5', method: 'lr', value: 8, rule: 'two', target: 'fixed' },
+  'Two seeds, one diagonal': { shape: 'k5', method: 'lr', value: 10, rule: 'anchors', anchorN: 2, anchorWindow: 0, anchorSum: 0, target: 'fixed' },
+  'Anchor chain, window ±3': { shape: 'k5', method: 'lr', value: 10, rule: 'anchors', anchorN: 2, anchorWindow: 3, anchorSum: 0, target: 'fixed' },
+  'Diagonal, or anchors over an indel': { shape: 'k5', method: 'lr', value: 10, rule: 'either', bar: 24, anchorN: 2, anchorWindow: 3, anchorSum: 24, target: 'fixed' },
 };
-const CONTROL_IDS = ['shape', 'method', 'value', 'target', 'budget', 'coverage', 'sparsity', 'windowKeep', 'rule', 'bar', 'rankBits', 'clanAware', 'truth', 'set', 'c_lookup', 'c_hit', 'c_cand', 'c_bytes'];
+const CONTROL_IDS = ['shape', 'method', 'value', 'target', 'budget', 'coverage', 'sparsity', 'windowKeep', 'rule', 'bar', 'anchorN', 'anchorWindow', 'anchorSum', 'rankBits', 'clanAware', 'truth', 'set', 'c_lookup', 'c_hit', 'c_cand', 'c_bytes'];
 
 function buildSlopes(holder, prefix) {
   const div = el(holder);
@@ -68,6 +71,9 @@ function policy() {
     windowKeep: +el('windowKeep').value,
     rule: el('rule').value,
     bar: +el('bar').value,
+    anchorN: +el('anchorN').value,
+    anchorWindow: +el('anchorWindow').value,
+    anchorSum: +el('anchorSum').value,
     rankBits: el('rankBits').value === '' ? null : +el('rankBits').value,
     clanAware: el('clanAware').checked,
     truth: el('truth').value,
@@ -90,7 +96,10 @@ function showInputs(p) {
   el('budget-out').textContent = compact(p.budget);
   el('coverage-out').textContent = pct(p.coverage);
   el('sparsity-out').textContent = String(p.sparsity);
-  el('bar-row').hidden = p.rule !== 'diag';
+  el('bar-row').hidden = !['diag', 'either', 'both'].includes(p.rule);
+  el('anchor-rows').hidden = !['anchors', 'either', 'both'].includes(p.rule);
+  el('anchorWindow-out').textContent = `±${p.anchorWindow}`;
+  el('anchorSum-out').textContent = p.anchorSum ? `≥ ${p.anchorSum}` : 'any';
   el('bar-out').textContent = p.bar.toFixed(1);
   for (const id of ['c_lookup', 'c_hit', 'c_cand', 'c_bytes']) el(`${id}-out`).textContent = el(id).value;
   for (const pre of ['seed', 'bar']) {
@@ -193,13 +202,13 @@ function plotFamilies(res) {
     { x: labels, y: bins.map(p10), mode: 'lines+markers', name: 'p10', line: { color: COLORS.second } },
   ], { ...LAYOUT, title: { text: `Recall by ${spec.label.toLowerCase()}`, font: { size: 13 } }, yaxis: { range: [0, 1.02], title: 'Recall' }, xaxis: { tickangle: -30, automargin: true } }, { responsive: true });
   Plotly.react('plot-hist', [{ x: fam.map((r) => r.recall), type: 'histogram', xbins: { start: 0, end: 1.0001, size: 0.05 }, marker: { color: COLORS.main } }], { ...LAYOUT, title: { text: 'Family recall', font: { size: 13 } }, xaxis: { title: 'Recall in the family', range: [0, 1.02] }, yaxis: { title: 'Families' }, showlegend: false }, { responsive: true });
-  Plotly.react('plot-scatter', [{ x: fam.map(xOf), y: fam.map((r) => r.recall + (Math.random() - 0.5) * 0.02), text: fam.map((r) => `${models.name[r.m]} ${models.acc[r.m]}, ${r.n} hits`), mode: 'markers', type: 'scattergl', marker: { size: 4, opacity: 0.4, color: COLORS.main } }], { ...LAYOUT, title: { text: 'Each family', font: { size: 13 } }, xaxis: { title: spec.label, type: spec.log ? 'log' : 'linear' }, yaxis: { title: 'Recall (jittered)', range: [-0.03, 1.05] }, showlegend: false }, { responsive: true });
+  Plotly.react('plot-scatter', [{ x: fam.map(xOf), y: fam.map((r) => r.recall + (Math.random() - 0.5) * 0.02), text: fam.map((r) => `${models.name[r.m]} ${models.acc[r.m]}, ${r.n} hits`), mode: 'markers', marker: { size: 4, opacity: 0.4, color: COLORS.main } }], { ...LAYOUT, title: { text: 'Each family', font: { size: 13 } }, xaxis: { title: spec.label, type: spec.log ? 'log' : 'linear' }, yaxis: { title: 'Recall (jittered)', range: [-0.03, 1.05] }, showlegend: false }, { responsive: true });
   Plotly.react('plot-spend', [
     { x: labels, y: bins.map((b) => mean(b, (r) => r.perColumn)), type: 'bar', name: 'Entries per column', marker: { color: COLORS.muted } },
   ], { ...LAYOUT, title: { text: 'Index spent per column, same bins', font: { size: 13 } }, yaxis: { type: 'log', title: 'Entries per column' }, xaxis: { tickangle: -30, automargin: true }, showlegend: false }, { responsive: true });
   const worst = fam.filter((r) => r.n >= 3).sort((a, b) => a.recall - b.recall || b.weight - a.weight).slice(0, 25);
   el('worst').innerHTML = `<tr><th>Family</th><th>Hits</th><th>Recall</th><th>Length</th><th>GA</th><th>Seed seqs</th><th>Mean info</th><th>Best window</th><th>T</th><th>Entries/col</th></tr>${
-    worst.map((r) => `<tr><td>${models.name[r.m]} <small>${models.acc[r.m]}</small></td><td>${r.n}</td><td>${r.recall.toFixed(2)}</td><td>${models.length[r.m]}</td><td>${models.ga[r.m]}</td><td>${models.nseq[r.m]}</td><td>${models.mean_info[r.m].toFixed(2)}</td><td>${models.top_info[r.m].toFixed(1)}</td><td>${res.T[r.m].toFixed(1)}</td><td>${compact(r.perColumn)}</td></tr>`).join('')}`;
+    worst.map((r) => `<tr data-model="${r.m}" style="cursor:pointer"><td>${models.name[r.m]} <small>${models.acc[r.m]}</small></td><td>${r.n}</td><td>${r.recall.toFixed(2)}</td><td>${models.length[r.m]}</td><td>${models.ga[r.m]}</td><td>${models.nseq[r.m]}</td><td>${models.mean_info[r.m].toFixed(2)}</td><td>${models.top_info[r.m].toFixed(1)}</td><td>${res.T[r.m].toFixed(1)}</td><td>${compact(r.perColumn)}</td></tr>`).join('')}`;
 }
 
 const saved = (() => { try { return JSON.parse(localStorage.getItem('kfpfam-saved') || '[]'); } catch { return []; } })();
@@ -240,9 +249,13 @@ async function update() {
   const res = evaluate(p, d);
   const s = summary(p, res);
   readouts(s);
-  el('caveat').textContent = p.rule !== 'diag' ? 'Two-hit candidates only count diagonals scoring ≥ 18 bits, so they read a little low; one-seed candidates come from the background model.' : '';
+  const floor = common.meta.anchorFloor?.[p.shape];
+  el('caveat').textContent = p.rule === 'seed' ? 'One-seed candidates come from the background model.'
+    : ['anchors', 'either', 'both'].includes(p.rule) && (p.method !== 'lr' || p.target !== 'fixed' || p.value < floor)
+      ? `Background anchors on weak diagonals were kept only at ≥ ${floor} bits for this seed, so candidates read low for anchors below that.` : '';
   plotBars(p, res, d);
   plotFamilies(res);
+  drawFamily(p, res, d, common);
   el('status').textContent = `Evaluated in ${(performance.now() - t0).toFixed(0)} ms; ${d.truth.rows.toLocaleString()} seeds in ${common.pairs.n.toLocaleString()} hits, ${d.bg.rows.rows.toLocaleString()} background seeds over ${common.meta.reads} reads.`;
   clearTimeout(update.t);
   update.t = setTimeout(() => plotSweep(p), 250);
@@ -300,6 +313,8 @@ async function main() {
     a.click();
   };
   el('shapes-all').onclick = compareShapes;
+  setupFamily(common, update);
+  el('worst').addEventListener('click', (e) => { const tr = /** @type {HTMLElement} */ (e.target).closest('tr'); if (tr?.dataset.model) { el('family').value = common.models.name[+tr.dataset.model]; update(); el('plot-family').scrollIntoView(); } });
   drawSaved();
   await update();
 }

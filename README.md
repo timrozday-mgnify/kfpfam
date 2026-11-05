@@ -26,7 +26,7 @@ Local data goes in `data/` (not tracked). Pfam-A comes from
 
 `web/` compares k-mer policies: how k-mers are drawn from the HMMs, sparsity, the read hit rule and the
 information bar, and how each adapts per Pfam. Every number is recomputed in the browser from seeds
-measured across all of Pfam. Its data is not tracked (77 MB). To rebuild it, with Pfam-A, its clans and
+measured across all of Pfam. Its data is not tracked (136 MB). To rebuild it, with Pfam-A, its clans and
 seed alignments in `data/pfam/`, the exploration sets in `data/explore/` and MGnify proteins:
 
 ```bash
@@ -42,6 +42,7 @@ python3 -m http.server 8791 --bind 127.0.0.1 -d web  # then open http://127.0.0.
 
 ```bash
 node checks/test_policy.mjs  # policy engine against the separate Python scan
+node checks/compare_rules.mjs  # read hit rules side by side
 ```
 
 Related: [kmer-functional-profiler](https://github.com/timrozday-mgnify/kmer-functional-profiler),

@@ -76,11 +76,18 @@
   <fieldset><legend>Read hit policy</legend>
     <label>A model is a candidate when
       <select id="rule">
-        <option value="diag">A seed's diagonal scores ≥ the bar</option>
-        <option value="two">Two non-overlapping seeds share a diagonal</option>
+        <option value="diag">Diagonal score ≥ the bar</option>
+        <option value="anchors">Anchor chain in a distance window</option>
+        <option value="either">Either the diagonal or the anchor chain</option>
+        <option value="both">Both the diagonal and the anchor chain</option>
         <option value="seed">Any one seed hits</option>
       </select></label>
     <label id="bar-row">Information bar, ungapped bits <span id="bar-out"></span><input type="range" id="bar" min="18" max="50" step="0.5" value="22"></label>
+    <div id="anchor-rows">
+      <label>Anchors in the chain <select id="anchorN"><option value="2">2</option><option value="3">3</option></select></label>
+      <label>Distance window, ± diagonals <span id="anchorWindow-out"></span><input type="range" id="anchorWindow" min="0" max="6" step="1" value="3"></label>
+      <label>Chain score, summed bits <span id="anchorSum-out"></span><input type="range" id="anchorSum" min="0" max="60" step="1" value="0"></label>
+    </div>
     <label>And within this of the read's best
       <select id="rankBits"><option value="">No rank rule</option><option value="5">5 bits</option><option value="10">10 bits</option><option value="15">15 bits</option><option value="20">20 bits</option></select></label>
     <label class="check"><input type="checkbox" id="clanAware"> <span>Rank rule keeps the best model's clan</span></label>
@@ -128,8 +135,20 @@
   <div id="plot-spend"></div>
 </div>
 <p class="note">Bins are equal-sized groups of families sampled for this set. A falling bar on the trait is a case for a slope above, and the spend panel shows what that slope would cost. Families here have at least one hit in the sample; family recalls rest on few reads, so the tail includes sampling noise.</p>
-<h3>Worst families (at least 3 hits)</h3>
+<h3>Worst families (at least 3 hits; click one to see it below)</h3>
 <div class="table-wrap"><table id="worst"></table></div>
+
+<h2>One family: where the anchors are</h2>
+<div class="row">
+  <label>Family <input id="family" list="family-list" size="34" placeholder="Name or accession" aria-label="Family name or accession"></label>
+  <datalist id="family-list"></datalist>
+  <button type="button" id="family-random">Random with hits</button>
+  <label>Read length, aa <select id="family-read"><option value="50">50 (150 bp)</option><option value="33">33 (100 bp)</option></select></label>
+</div>
+<div class="readouts" id="family-readouts"></div>
+<div id="plot-family" style="height:760px"></div>
+<p class="note" id="family-note"></p>
+<div class="table-wrap"><table id="family-kmers"></table></div>
 
 <h2>Choices</h2>
 <div class="row">
@@ -141,7 +160,7 @@
 <div class="table-wrap"><table id="saved"></table></div>
 <div class="table-wrap"><table id="shape-table"></table></div>
 
-<script src="https://cdn.jsdelivr.net/npm/plotly.js-basic-dist-min@2.35.2/plotly-basic.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-cartesian-dist-min@2.35.2/plotly-cartesian.min.js"></script>
 <script type="module" src="main.js"></script>
 </body>
 </html>

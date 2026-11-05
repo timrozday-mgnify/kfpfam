@@ -19,6 +19,21 @@ async function bytes(name) {
 }
 const json = async (name) => JSON.parse(new TextDecoder().decode(await bytes(name)));
 
+/** A model's log-odds in bits, length x 20, from its piece of the profile. */
+const pieces = new Map();
+export async function loadProfile(m, models) {
+  const n = models.acc.length;
+  const CHUNKS = 200;
+  let c = Math.floor((m * CHUNKS) / n);
+  while (Math.floor(((c + 1) * n) / CHUNKS) <= m) c++;
+  while (Math.floor((c * n) / CHUNKS) > m) c--;
+  if (!pieces.has(c)) pieces.set(c, new Int8Array(await bytes(`profile/${c}.bin.gz`)));
+  const piece = pieces.get(c);
+  let at = 0;
+  for (let i = Math.floor((c * n) / CHUNKS); i < m; i++) at += models.length[i];
+  return piece.subarray(at * 20, (at + models.length[m]) * 20);
+}
+
 export async function loadCommon() {
   const [models, rawPairs, meta, baselines] = await Promise.all([json('models.json.gz'), json('pairs.json.gz'), json('meta.json'), json('baselines.json')]);
   models.z = {};
