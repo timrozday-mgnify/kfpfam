@@ -279,19 +279,30 @@ export function binOf(scheme, evalue, score, ga) {
 /** Recall by match strength, and how candidates of a read set and its decoys spread over the bins. */
 export function byStrength(res, policy, d, scheme) {
   const bins = binsFor(scheme);
-  const out = bins.map((b) => ({ label: b.label, n: 0, weight: 0, ok: 0, real: 0, decoy: 0 }));
+  const out = bins.map((b) => ({ label: b.label, n: 0, weight: 0, ok: 0, real: 0, decoy: 0, hits: 0, decoyHits: 0 }));
   const want = policy.set || 'all';
   const { pairs } = d;
+  // When hmmsearch rated more reads than were scanned, reported hits get their rates from all of them
+  const rated = d.meta.truthReads;
   for (let g = 0; g < pairs.n; g++) {
-    if (want !== 'all' ? pairs.set[g] !== want : !pairs.set[g].startsWith('f')) continue;
+    const isDecoy = rated && pairs.set[g] === `${want}decoy`;
+    if (!isDecoy && (want !== 'all' ? pairs.set[g] !== want : !pairs.set[g].startsWith('f'))) continue;
     const b = out[binOf(scheme, pairs.evalue[g], pairs.score[g], d.models.ga[pairs.model[g]])];
     const w = pairs.weight[g];
+    const ok = passes(policy, res.truthEv, g, pairs.model[g], res.bars, pairs.best, pairs.bestModel, d.models);
+    if (isDecoy) {
+      b.decoyHits += w / rated;
+      if (ok) b.decoy += w / rated;
+      continue;
+    }
     b.n++; b.weight += w;
-    if (passes(policy, res.truthEv, g, pairs.model[g], res.bars, pairs.best, pairs.bestModel, d.models)) b.ok += w;
+    if (rated) b.hits += w / rated;
+    if (ok) { b.ok += w; if (rated) b.real += w / rated; }
   }
   const spread = (set, ev, key) => {
     for (let g = 0; g < set.rows.groups; g++) {
       const m = set.model[g];
+      if (rated && set.score[g] > -900) continue;
       if (ev.best[g] && passes(policy, ev, g, m, res.bars, set.bestByGroup, set.bestModelByGroup, d.models)) {
         out[binOf(scheme, set.evalue[g], set.score[g], d.models.ga[m])][key] += 1 / set.reads;
       }

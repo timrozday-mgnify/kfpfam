@@ -44,7 +44,9 @@ export async function loadCommon() {
     models.z[f] = Float32Array.from(v, (x) => (x - mean) / sd);
   }
   const pairs = { ...rawPairs, n: rawPairs.model.length, model: Uint16Array.from(rawPairs.model), weight: Float32Array.from(rawPairs.weight), best: Float32Array.from(rawPairs.best), bestModel: Uint16Array.from(rawPairs.bestModel) };
-  return { models, pairs, meta, baselines: baselines.tools, byBin: baselines.byBin, hmmsearchMs: baselines.hmmsearch_ms_per_read, provenance: baselines.provenance };
+  // Real reads have their own background; absent until measure/run_real_policy.sh has run
+  const realMeta = await json('real/meta.json').catch(() => null);
+  return { models, pairs, meta, realMeta, baselines: baselines.tools, byBin: baselines.byBin, hmmsearchMs: baselines.hmmsearch_ms_per_read, provenance: baselines.provenance };
 }
 
 /** Background rows per (read, model), with each one's rating by hmmsearch if it was reported. */
@@ -70,15 +72,27 @@ function backgroundSet(rows, g, reads, best, bestModel, hits) {
   return { rows, read, model, reads, bestByGroup, bestModelByGroup, evalue, score };
 }
 
+/** One read set's background and decoys. */
+async function loadReads(shape, meta, dir = '') {
+  const [bgBuf, groupBuf] = await Promise.all([`${dir}${shape}.bg.gz`, `${dir}${shape}.bggroups.gz`].map(bytes));
+  const bg = backgroundSet(parseRows(bgBuf), new Uint16Array(groupBuf), meta.reads, meta.readBest, meta.readBestModel, meta.bgHits);
+  if (!meta.decoyHits) return { bg, decoy: null };
+  const [dBuf, dGroups] = await Promise.all([`${dir}${shape}.decoy.gz`, `${dir}${shape}.decoygroups.gz`].map(bytes));
+  return { bg, decoy: backgroundSet(parseRows(dBuf), new Uint16Array(dGroups), meta.reads, meta.decoyBest, meta.decoyBestModel, meta.decoyHits) };
+}
+
+export const loadReal = (shape, common) => loadReads(shape, common.realMeta, 'real/');
+
+/** The data a policy is evaluated on: real reads bring their own background, decoys and rates. */
+export const withSet = (common, shape, set) => (set === 'real' && shape.real
+  ? { ...common, ...shape, ...shape.real, meta: common.realMeta }
+  : { ...common, ...shape, meta: common.meta });
+
 export async function loadShape(shape, common) {
-  const [truthBuf, bgBuf, groupBuf, tabBuf, wordsBuf, strataBuf] = await Promise.all(
-    [`${shape}.rows.gz`, `${shape}.bg.gz`, `${shape}.bggroups.gz`, `${shape}.tab.gz`, `${shape}.words.bin`, `${shape}.strata.bin`].map(bytes),
-  );
-  let decoy = null;
-  if (common.meta.decoyHits) {
-    const [dBuf, dGroups] = await Promise.all([`${shape}.decoy.gz`, `${shape}.decoygroups.gz`].map(bytes));
-    decoy = backgroundSet(parseRows(dBuf), new Uint16Array(dGroups), common.meta.reads, common.meta.decoyBest, common.meta.decoyBestModel, common.meta.decoyHits);
-  }
+  const [truthBuf, tabBuf, wordsBuf, strataBuf, reads] = await Promise.all([
+    ...[`${shape}.rows.gz`, `${shape}.tab.gz`, `${shape}.words.bin`, `${shape}.strata.bin`].map(bytes),
+    loadReads(shape, common.meta),
+  ]);
   const nm = common.models.acc.length;
   const ng = 21 + 27;
   const logs = new Int16Array(tabBuf, 0, nm * ng * 2);
@@ -105,13 +119,11 @@ export async function loadShape(shape, common) {
       return { n: strata[(fi * 21 + ti) * 2], f: strata[(fi * 21 + ti) * 2 + 1] };
     },
   };
-  const bg = backgroundSet(parseRows(bgBuf), new Uint16Array(groupBuf), common.meta.reads, common.meta.readBest, common.meta.readBestModel, common.meta.bgHits);
   const shapeCols = common.meta.shapes[shape];
   return {
     tab,
     truth: parseRows(truthBuf),
-    bg,
-    decoy,
+    ...reads,
     span: shapeCols[shapeCols.length - 1] + 1,
   };
 }

@@ -5,6 +5,8 @@ sets.py fragments DOMTBL[,DOMTBL] PROTEINS.faa OUT PER_FAMILY
     family and length, so rare families count. Each has a weight restoring the family's abundance.
 sets.py pairs FRAGMENTS_META FRAG_DOMTBL FRAGS.faa READS_ORFS.faa READS_DOMTBL MODELS.tsv OUT
     The (sequence, model) pairs to score a filter on, across match strength.
+sets.py extend SET ORFS.faa DOMTBL MODELS.tsv OUT MAX_PER_BIN
+    Appends one read set's hmmsearch hits to OUT.seqs.tsv and OUT.meta.tsv.
 """
 
 import csv
@@ -75,6 +77,38 @@ def e_bin(evalue):
     return 6
 
 
+def best_hits(table, index):
+    best = {}
+    for q, acc, evalue, score, *_ in domtbl(table):
+        key = (q, index[acc])
+        if key not in best or score > best[key][1]:
+            best[key] = (evalue, score)
+    return best
+
+
+def read_pairs(name, table, seqs, index, ga, s, o, max_per_bin, rng):
+    """Every model hmmsearch reports, capped per E-value bin. Weights restore what the caps removed."""
+    bins = defaultdict(list)
+    for k, v in best_hits(table, index).items():
+        bins[e_bin(v[0])].append((k, v))
+    for b, items in sorted(bins.items()):
+        rng.shuffle(items)
+        kept = items[:max_per_bin]
+        print(name, "bin", b, len(items), "kept", len(kept))
+        for (q, m), (e, sc) in kept:
+            s.write(f"{seqs[q]}\t{m}\n")
+            o.write(f"{name}\t{q}\t{m}\t{len(items) / len(kept):.2f}\t{e:.3g}\t{sc}\t{int(sc >= ga[m])}\n")
+
+
+def extend(name, orfs, table, models, out, max_per_bin):
+    with open(models) as f:
+        rows = list(csv.DictReader(f, delimiter="\t"))
+    index = {r["acc"]: i for i, r in enumerate(rows)}
+    ga = [float(r["ga"]) for r in rows]
+    with open(out + ".seqs.tsv", "a") as s, open(out + ".meta.tsv", "a") as o:
+        read_pairs(name, table, dict(fasta(orfs)), index, ga, s, o, int(max_per_bin), random.Random(29))
+
+
 def pairs(meta_path, frag_table, frags, orfs, reads_table, models, out, max_per_bin=1500, per_family=3):
     """Pairs to score a filter on, across match strength.
 
@@ -92,15 +126,7 @@ def pairs(meta_path, frag_table, frags, orfs, reads_table, models, out, max_per_
     seqs = dict(fasta(frags))
     seqs.update(fasta(orfs))
 
-    def hits(table):
-        best = {}
-        for q, acc, evalue, score, *_ in domtbl(table):
-            key = (q, index[acc])
-            if key not in best or score > best[key][1]:
-                best[key] = (evalue, score)
-        return best
-
-    frag_hits = hits(frag_table)
+    frag_hits = best_hits(frag_table, index)
     with open(out + ".seqs.tsv", "w") as s, open(out + ".meta.tsv", "w") as o:
         o.write("set\tquery\tmodel\tweight\tevalue\tscore\tga_pass\n")
         found, missed = defaultdict(list), defaultdict(list)
@@ -120,20 +146,13 @@ def pairs(meta_path, frag_table, frags, orfs, reads_table, models, out, max_per_
                     o.write(f"f{length}\t{q}\t{m}\t{w * scale:.2f}\t{e:.3g}\t{sc}\t{int(sc >= ga[m])}\n")
                     n += 1
         print(n, "fragment pairs")
-        bins = defaultdict(list)
-        for k, v in hits(reads_table).items():
-            bins[e_bin(v[0])].append((k, v))
-        for b, items in sorted(bins.items()):
-            rng.shuffle(items)
-            kept = items[:max_per_bin]
-            print("reads bin", b, len(items), "kept", len(kept))
-            for (q, m), (e, sc) in kept:
-                s.write(f"{seqs[q]}\t{m}\n")
-                o.write(f"reads\t{q}\t{m}\t{len(items) / len(kept):.2f}\t{e:.3g}\t{sc}\t{int(sc >= ga[m])}\n")
+        read_pairs("reads", reads_table, seqs, index, ga, s, o, max_per_bin, rng)
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "fragments":
         fragments(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]))
+    elif sys.argv[1] == "extend":
+        extend(*sys.argv[2:8])
     else:
         pairs(*sys.argv[2:9])

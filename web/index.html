@@ -96,7 +96,7 @@
     <label>Hits to keep
       <select id="truth"><option value="ga">hmmsearch ≥ GA</option><option value="e3">hmmsearch E ≤ 1e-3</option><option value="e10">hmmsearch E ≤ 10</option><option value="all">All, including fragments hmmsearch misses</option></select></label>
     <label>Sequences
-      <select id="set"><option value="reads">Simulated 150 bp reads from reference genomes, all frames</option><option value="f50">MGnify fragments, 50 aa, family-balanced</option><option value="f33">MGnify fragments, 33 aa, family-balanced</option><option value="all">Both fragment sets</option></select></label>
+      <select id="set"><option value="real">Real gut metagenome ERR10889147, 124 nt, all frames</option><option value="reads">Simulated 150 bp reads from reference genomes, all frames</option><option value="f50">MGnify fragments, 50 aa, family-balanced</option><option value="f33">MGnify fragments, 33 aa, family-balanced</option><option value="all">Both fragment sets</option></select></label>
     <details><summary>Cost assumptions</summary>
       <label>Lookup, ns <span id="c_lookup-out"></span><input type="range" id="c_lookup" min="5" max="200" step="5" value="20"></label>
       <label>Seed hit, rescored, ns <span id="c_hit-out"></span><input type="range" id="c_hit" min="10" max="400" step="10" value="150"></label>
@@ -131,7 +131,7 @@
   <div id="plot-precision"></div>
 </div>
 <div class="table-wrap"><table id="strength-table"></table></div>
-<p class="note">Recall in each bin, for the set chosen above. "Not reported" fragments are from a family where hmmsearch found nothing, so recall there is what hmmsearch itself lacks. Right: where each read's candidates fall, against the same reads reversed. A weak or unreported candidate may still be true, so precision is estimated from decoys: 1 − decoy / real, per bin, not from hmmsearch's verdict.</p>
+<p class="note">Recall in each bin, for the set chosen above. "Not reported" fragments are from a family where hmmsearch found nothing, so recall there is what hmmsearch itself lacks. Right: where each read's candidates fall, against the same reads reversed. A weak or unreported candidate may still be true, so precision is estimated from decoys: 1 − decoy / real, per bin, not from hmmsearch's verdict. On the real metagenome, reported hits come from all 50,000 reads hmmsearch rated and their 50,000 reversed copies; the "not reported" bin needs a scan over every model, so it comes from 300 of those reads.</p>
 
 <h2>Is every Pfam served?</h2>
 <div class="row">

@@ -67,11 +67,69 @@ def profile_chunks(prep, out, chunks=200):
             f.write(q.tobytes())
 
 
+def export_reads(scan, out, index):
+    """One read set: background and decoy seeds, each read's best model, hmmsearch's ratings."""
+    for shape in SHAPES:
+        thin_background(scan / "bg" / f"{shape}.bg.gz", scan / "bg" / f"{shape}.bggroups.gz",
+                        out / f"{shape}.bg.gz", out / f"{shape}.bggroups.gz")
+        if (scan / "decoy").exists():
+            thin_background(scan / "decoy" / f"{shape}.bg.gz", scan / "decoy" / f"{shape}.bggroups.gz",
+                            out / f"{shape}.decoy.gz", out / f"{shape}.decoygroups.gz")
+    # best over each read's ORFs
+    byread = {}
+    for read, score, model in (line.split("\t")[:3] for line in open(scan / "bg.best.tsv").read().splitlines()):
+        if read not in byread or float(score) > byread[read][0]:
+            byread[read] = (float(score), int(model))
+    orfs = [line.split("\t") for line in open(scan / "bg.orfs.tsv").read().splitlines()]
+    reads = max(int(o[0]) for o in orfs) + 1
+    meta = {
+        "reads": reads,
+        "residuesPerRead": sum(len(o[1]) for o in orfs) / reads,
+        "orfsPerRead": len(orfs) / reads,
+        "readBest": [byread.get(str(i), (0, 0))[0] for i in range(reads)],
+        "readBestModel": [byread.get(str(i), (0, 0))[1] for i in range(reads)],
+        "shapes": {k: list(v) for k, v in SHAPES.items()},
+        "fracs": FRACS,
+        "anchorFloor": {"k4": 9, "k5": 9.5, "k6": 10.5, "k7": 11.5, "s5": 9.5, "s6": 10.5, "p33": 10.5},
+        "maxWindow": 6,
+    }
+    if (scan / "truth_reads").exists():
+        meta["truthReads"] = int((scan / "truth_reads").read_text())
+    # How hmmsearch rates each read and model of the background and its decoys
+    for key, table, best_file in (("bgHits", "reads.domtbl", "bg.best.tsv"), ("decoyHits", "decoy.domtbl", "decoy.best.tsv")):
+        path = scan / "hmm" / table
+        if not path.exists():
+            continue
+        found = {}
+        with open(path) as f:
+            for line in f:
+                if line[0] == "#":
+                    continue
+                c = line.split()
+                read = int(c[0][1:].split("_")[0])
+                if read >= reads:
+                    continue
+                k = (read, index[c[4].split(".")[0]])
+                e, sc = float(c[6]), float(c[13])
+                if k not in found or sc > found[k][1]:
+                    found[k] = (e, sc)
+        meta[key] = [[k[0], k[1], v[0], v[1]] for k, v in found.items()]
+        if key == "decoyHits":
+            byread = {}
+            for read, score, model in (line.split("\t")[:3] for line in open(scan / best_file).read().splitlines()):
+                if read not in byread or float(score) > byread[read][0]:
+                    byread[read] = (float(score), int(model))
+            meta["decoyBest"] = [byread.get(str(i), (0, 0))[0] for i in range(reads)]
+            meta["decoyBestModel"] = [byread.get(str(i), (0, 0))[1] for i in range(reads)]
+    (out / "meta.json").write_text(json.dumps(meta))
+
+
 def main():
     scan, prep, abundance, out = (Path(a) for a in sys.argv[1:5])
     out.mkdir(parents=True, exist_ok=True)
     with open(prep / "models.tsv") as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
+    index = {r["acc"]: i for i, r in enumerate(rows)}
     count = Counter()
     with open(abundance) as f:
         for line in f:
@@ -98,11 +156,7 @@ def main():
         np.round(ratio, 4).astype(np.float32).tofile(out / f"{shape}.strata.bin")
         shutil.copy(scan / "bg" / f"{shape}.words.bin", out / f"{shape}.words.bin")
         shutil.copy(scan / "truth" / f"{shape}.rows.gz", out / f"{shape}.rows.gz")
-        thin_background(scan / "bg" / f"{shape}.bg.gz", scan / "bg" / f"{shape}.bggroups.gz",
-                        out / f"{shape}.bg.gz", out / f"{shape}.bggroups.gz")
-        if (scan / "decoy").exists():
-            thin_background(scan / "decoy" / f"{shape}.bg.gz", scan / "decoy" / f"{shape}.bggroups.gz",
-                            out / f"{shape}.decoy.gz", out / f"{shape}.decoygroups.gz")
+    export_reads(scan, out, index)
 
     # pairs, with each query's best diagonal over all models
     with open(scan / "pairs.meta.tsv") as f:
@@ -121,52 +175,10 @@ def main():
     }
     with gzip.open(out / "pairs.json.gz", "wt") as f:
         json.dump(doc, f, separators=(",", ":"))
-    # background reads: best over each read's ORFs
-    byread = {}
-    for read, score, model in (line.split("\t") for line in open(scan / "bg.best.tsv").read().splitlines()):
-        if read not in byread or float(score) > byread[read][0]:
-            byread[read] = (float(score), int(model))
-    orfs = [line.split("\t") for line in open(scan / "bg.orfs.tsv").read().splitlines()]
-    reads = max(int(o[0]) for o in orfs) + 1
-    meta = {
-        "reads": reads,
-        "residuesPerRead": sum(len(o[1]) for o in orfs) / reads,
-        "orfsPerRead": len(orfs) / reads,
-        "readBest": [byread.get(str(i), (0, 0))[0] for i in range(reads)],
-        "readBestModel": [byread.get(str(i), (0, 0))[1] for i in range(reads)],
-        "shapes": {k: list(v) for k, v in SHAPES.items()},
-        "fracs": FRACS,
-        "anchorFloor": {"k4": 9, "k5": 9.5, "k6": 10.5, "k7": 11.5, "s5": 9.5, "s6": 10.5, "p33": 10.5},
-        "maxWindow": 6,
-    }
-    # How hmmsearch rates each read and model of the background and its decoys
-    index = {r["acc"]: i for i, r in enumerate(rows)}
-    for key, table, best_file in (("bgHits", "reads.domtbl", "bg.best.tsv"), ("decoyHits", "decoy.domtbl", "decoy.best.tsv")):
-        path = scan / "hmm" / table
-        if not path.exists():
-            continue
-        found = {}
-        with open(path) as f:
-            for line in f:
-                if line[0] == "#":
-                    continue
-                c = line.split()
-                read = int(c[0][1:].split("_")[0])
-                if read >= reads:
-                    continue
-                k = (read, index[c[4].split(".")[0]])
-                e, sc = float(c[6]), float(c[13])
-                if k not in found or sc > found[k][1]:
-                    found[k] = (e, sc)
-        meta[key] = [[k[0], k[1], v[0], v[1]] for k, v in found.items()]
-        if key == "decoyHits":
-            byread = {}
-            for read, score, model in (line.split("\t") for line in open(scan / best_file).read().splitlines()):
-                if read not in byread or float(score) > byread[read][0]:
-                    byread[read] = (float(score), int(model))
-            meta["decoyBest"] = [byread.get(str(i), (0, 0))[0] for i in range(reads)]
-            meta["decoyBestModel"] = [byread.get(str(i), (0, 0))[1] for i in range(reads)]
-    (out / "meta.json").write_text(json.dumps(meta))
+    # Real reads: their own background, decoys and rates; the shared tables stay above
+    if (scan / "real").exists():
+        (out / "real").mkdir(exist_ok=True)
+        export_reads(scan / "real", out / "real", index)
     profile_chunks(prep, out)
     print(sum(p.stat().st_size for p in out.iterdir()) / 1e6, "MB")
 

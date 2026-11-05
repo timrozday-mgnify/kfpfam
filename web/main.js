@@ -1,7 +1,7 @@
 // @ts-check
 /* global Plotly */
 import { barSweep, byStrength, estimateMs, evaluate, FEATURES, N_GRID, parseRows } from './policy.js';
-import { loadCommon, loadShape } from './load.js';
+import { loadCommon, loadReal, loadShape, withSet } from './load.js';
 import { drawFamily, setupFamily } from './family.js';
 
 const el = (id) => /** @type {HTMLInputElement} */ (document.getElementById(id));
@@ -107,7 +107,11 @@ function showInputs(p) {
   }
 }
 
-const dataFor = (shape) => ({ ...common, ...shapes[shape], meta: common.meta });
+const dataFor = (shape) => withSet(common, shapes[shape], el('set').value);
+async function ensure(shape) {
+  if (!shapes[shape]) shapes[shape] = await loadShape(shape, common);
+  if (el('set').value === 'real' && !shapes[shape].real) shapes[shape].real = await loadReal(shape, common);
+}
 
 function summary(p, res) {
   const c = costs();
@@ -188,16 +192,18 @@ function plotStrength(p, res, d) {
   const traces = [{ x: labels, y: bins.map((b) => (b.weight ? b.ok / b.weight : null)), mode: 'lines+markers', name: 'This policy', line: { color: COLORS.main, width: 3 } }];
   for (const t of common.byBin?.tools || []) {
     const series = t.recall?.[p.set === 'all' ? 'fragments' : p.set]?.[scheme];
-    if (series) traces.push({ x: labels, y: series, mode: 'lines+markers', name: t.tool, line: { dash: 'dot' } });
+    // Relaxed nail settings start off the plot, one click away in the legend
+    if (series) traces.push({ x: labels, y: series, mode: 'lines+markers', name: t.tool, line: { dash: 'dot' }, visible: /^nail (seeds|report)$|^MMseqs2/.test(t.tool) ? true : 'legendonly' });
   }
   Plotly.react('plot-strength', traces, { ...LAYOUT, title: { text: 'Recall by match strength', font: { size: 13 } }, yaxis: { title: 'Recall', range: [0, 1.02] }, xaxis: { type: 'category', tickangle: -30, automargin: true } }, { responsive: true });
+  const rated = d.meta.truthReads;
   const prec = (b) => (b.real > 0 ? Math.max(0, 1 - b.decoy / b.real) : null);
   Plotly.react('plot-precision', [
     { x: labels, y: bins.map((b) => b.real), type: 'bar', name: 'Reads', marker: { color: COLORS.main } },
     { x: labels, y: bins.map((b) => b.decoy), type: 'bar', name: 'Reversed reads', marker: { color: COLORS.second } },
   ], { ...LAYOUT, barmode: 'group', title: { text: 'Candidates per read, by how hmmsearch rates them', font: { size: 13 } }, yaxis: { title: 'Candidates per read', type: 'log' }, xaxis: { type: 'category', tickangle: -30, automargin: true } }, { responsive: true });
-  el('strength-table').innerHTML = `<tr><th>Bin</th><th>Hits in sample</th><th>Recall</th><th>Candidates / read</th><th>Decoy candidates / read</th><th>Precision (est.)</th></tr>${
-    bins.map((b) => `<tr><td>${b.label}</td><td>${b.n}</td><td>${b.weight ? pct(b.ok / b.weight) : '–'}</td><td>${compact(b.real)}</td><td>${compact(b.decoy)}</td><td>${prec(b) === null ? '–' : pct(prec(b))}</td></tr>`).join('')}`;
+  el('strength-table').innerHTML = `<tr><th>Bin</th><th>Hits in sample</th><th>Recall</th><th>Candidates / read</th><th>Decoy candidates / read</th><th>Precision (est.)</th>${rated ? '<th>hmmsearch hits / read</th><th>Decoy hits / read</th><th>hmmsearch precision (est.)</th>' : ''}</tr>${
+    bins.map((b) => `<tr><td>${b.label}</td><td>${b.n}</td><td>${b.weight ? pct(b.ok / b.weight) : '–'}</td><td>${compact(b.real)}</td><td>${compact(b.decoy)}</td><td>${prec(b) === null ? '–' : pct(prec(b))}</td>${rated ? `<td>${compact(b.hits)}</td><td>${compact(b.decoyHits)}</td><td>${b.hits ? pct(Math.max(0, 1 - b.decoyHits / b.hits)) : '–'}</td>` : ''}</tr>`).join('')}`;
 }
 
 function familyRows(res) {
@@ -259,11 +265,9 @@ async function update() {
   const token = ++pending;
   const p = policy();
   showInputs(p);
-  if (!shapes[p.shape]) {
-    el('status').textContent = `Loading ${p.shape}…`;
-    shapes[p.shape] = await loadShape(p.shape, common);
-    if (token !== pending) return;
-  }
+  el('status').textContent = `Loading ${p.shape}…`;
+  await ensure(p.shape);
+  if (token !== pending) return;
   const d = dataFor(p.shape);
   const t0 = performance.now();
   const res = evaluate(p, d);
@@ -277,7 +281,7 @@ async function update() {
   plotStrength(p, res, d);
   plotFamilies(res);
   drawFamily(p, res, d, common);
-  el('status').textContent = `Evaluated in ${(performance.now() - t0).toFixed(0)} ms; ${d.truth.rows.toLocaleString()} seeds in ${common.pairs.n.toLocaleString()} hits, ${d.bg.rows.rows.toLocaleString()} background seeds over ${common.meta.reads} reads.`;
+  el('status').textContent = `Evaluated in ${(performance.now() - t0).toFixed(0)} ms; ${d.truth.rows.toLocaleString()} seeds in ${common.pairs.n.toLocaleString()} hits, ${d.bg.rows.rows.toLocaleString()} background seeds over ${d.meta.reads} reads.`;
   clearTimeout(update.t);
   update.t = setTimeout(() => plotSweep(p), 250);
 }
@@ -287,7 +291,7 @@ async function compareShapes() {
   const rows = [];
   for (const shape of Object.keys(common.meta.shapes)) {
     el('status').textContent = `Loading ${shape}…`;
-    if (!shapes[shape]) shapes[shape] = await loadShape(shape, common);
+    await ensure(shape);
     const q = { ...p, shape };
     rows.push({ name: SHAPE_LABELS[shape], s: summary(q, evaluate(q, dataFor(shape))) });
   }
