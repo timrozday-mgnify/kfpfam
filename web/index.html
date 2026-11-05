@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kfpfam explorer</title>
+<style>
+  [hidden] { display: none !important; }
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #fff; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 24px 0 8px; border-top: 1px solid #ddd; padding-top: 16px; }
+  h3 { font-size: 13px; margin: 0 0 6px; color: #555; font-weight: 600; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; padding: 8px 12px; margin: 0; min-width: 0; }
+  legend { font-weight: 600; font-size: 13px; padding: 0 4px; }
+  #controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 12px; }
+  label { display: block; margin: 4px 0; }
+  label span { float: right; font-variant-numeric: tabular-nums; }
+  label.check span { float: none; }
+  input[type=range], select { width: 100%; }
+  #status { color: #666; margin: 8px 0; min-height: 1.4em; }
+  .readouts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 12px 0; }
+  .readouts div { border-left: 3px solid #ccc; padding-left: 8px; }
+  .readouts div.good { border-color: #2a9d5c; }
+  .readouts div.bad { border-color: #c8553d; }
+  .readouts b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .readouts small { color: #777; }
+  .plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 8px; }
+  .plots > div { height: 380px; min-width: 0; }
+  p.note { color: #666; max-width: 75em; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 8px 0; }
+  th, td { padding: 2px 10px; text-align: right; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th:first-child, td:first-child, td.text { text-align: left; }
+  button { font: inherit; padding: 4px 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  .row label { margin: 0; }
+  .row select { width: auto; }
+  #presets button { font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>kfpfam explorer: k-mer pre-filter policies for Pfam-A</h1>
+<p class="note">Choose how k-mers are drawn from the HMMs, how a read hit is called and how both adapt per Pfam. Recall is
+  against <code>hmmsearch</code> on the same sequence. Every number is recomputed here from seeds measured across all of Pfam, with no index built. <span id="provenance"></span></p>
+<div id="status" role="status">Loading…</div>
+
+<div class="row" id="presets"><b>Start from:</b></div>
+
+<form id="controls" onsubmit="return false">
+  <fieldset><legend>K-mers from the HMM</legend>
+    <label>Seed shape <select id="shape"></select></label>
+    <label>Selection
+      <select id="method">
+        <option value="lr">Enumerate: log-odds ≥ T</option>
+        <option value="topLR">Enumerate: top N per window, by log-odds</option>
+        <option value="topP">Enumerate: top N per window, by emission probability</option>
+        <option value="sample">Sample: n draws per window from emissions</option>
+        <option value="words">Observed: words in Pfam's seed alignment</option>
+      </select></label>
+    <label id="value-row"><i id="value-name"></i> <span id="value-out"></span><input type="range" id="value" step="0.25"></label>
+    <label id="target-row">T set by
+      <select id="target">
+        <option value="fixed">One T for all Pfams, plus adaptation below</option>
+        <option value="budget">A budget of entries per column</option>
+        <option value="coverage">Coverage of each Pfam's own emissions</option>
+      </select></label>
+    <label id="budget-row">Entries per column <span id="budget-out"></span><input type="range" id="budget" min="0" max="4" step="0.05" value="2"></label>
+    <label id="coverage-row">Coverage per window <span id="coverage-out"></span><input type="range" id="coverage" min="0.005" max="0.3" step="0.005" value="0.05"></label>
+  </fieldset>
+  <fieldset><legend>Sparsity</legend>
+    <label>By hash, keep 1 in m k-mers <span id="sparsity-out"></span><input type="range" id="sparsity" min="0" max="6" step="1" value="0"></label>
+    <label>Windows kept in each Pfam, most informative first
+      <select id="windowKeep"><option value="1">All</option><option value="0.5">Top 50%</option><option value="0.25">Top 25%</option><option value="0.1">Top 10%</option></select></label>
+    <p class="note">Hash sparsity shrinks the index and the read's lookups alike. Window sparsity spends the index where a family is conserved.</p>
+  </fieldset>
+  <fieldset><legend>Read hit policy</legend>
+    <label>A model is a candidate when
+      <select id="rule">
+        <option value="diag">A seed's diagonal scores ≥ the bar</option>
+        <option value="two">Two non-overlapping seeds share a diagonal</option>
+        <option value="seed">Any one seed hits</option>
+      </select></label>
+    <label id="bar-row">Information bar, ungapped bits <span id="bar-out"></span><input type="range" id="bar" min="18" max="50" step="0.5" value="22"></label>
+    <label>And within this of the read's best
+      <select id="rankBits"><option value="">No rank rule</option><option value="5">5 bits</option><option value="10">10 bits</option><option value="15">15 bits</option><option value="20">20 bits</option></select></label>
+    <label class="check"><input type="checkbox" id="clanAware"> <span>Rank rule keeps the best model's clan</span></label>
+  </fieldset>
+  <fieldset><legend>Evaluate on</legend>
+    <label>Hits to keep
+      <select id="truth"><option value="ga">hmmsearch ≥ GA</option><option value="e3">hmmsearch E ≤ 1e-3</option></select></label>
+    <label>Sequences
+      <select id="set"><option value="reads">Real 150 bp reads, all frames</option><option value="f50">MGnify fragments, 50 aa, family-balanced</option><option value="f33">MGnify fragments, 33 aa, family-balanced</option><option value="all">Both fragment sets</option></select></label>
+    <details><summary>Cost assumptions</summary>
+      <label>Lookup, ns <span id="c_lookup-out"></span><input type="range" id="c_lookup" min="5" max="200" step="5" value="20"></label>
+      <label>Seed hit, rescored, ns <span id="c_hit-out"></span><input type="range" id="c_hit" min="10" max="400" step="10" value="150"></label>
+      <label>Candidate in hmmsearch, µs <span id="c_cand-out"></span><input type="range" id="c_cand" min="1" max="200" step="1" value="20"></label>
+      <label>Bytes per index entry <span id="c_bytes-out"></span><input type="range" id="c_bytes" min="2" max="12" step="1" value="4"></label>
+    </details>
+  </fieldset>
+  <fieldset><legend>Adapt k-mer selection per Pfam</legend>
+    <div id="seed-slopes"></div>
+    <p class="note">Bits added to T per standard deviation of the trait (entries per window for top-N and sampling: halved per bit). Raising T for a trait spends less on it.</p>
+  </fieldset>
+  <fieldset><legend>Adapt the bar per Pfam</legend>
+    <div id="bar-slopes"></div>
+    <p class="note">Bits added to the bar per standard deviation. A long model has more chance diagonals, so a positive length slope is the E-value argument.</p>
+  </fieldset>
+</form>
+
+<div class="readouts" id="readouts"></div>
+<p class="note" id="caveat"></p>
+
+<h2>Trade-offs</h2>
+<div class="plots">
+  <div id="plot-bars"></div>
+  <div id="plot-sweep"></div>
+</div>
+<p class="note">Left: moving the bar with this k-mer set; baselines are measured tools on the real reads. Right: moving this policy's main value (T, N or n). Its budget is on the x axis.</p>
+
+<h2>Is every Pfam served?</h2>
+<div class="row">
+  <label>Trait <select id="feature"></select></label>
+</div>
+<div class="plots">
+  <div id="plot-bins"></div>
+  <div id="plot-hist"></div>
+  <div id="plot-scatter"></div>
+  <div id="plot-spend"></div>
+</div>
+<p class="note">Bins are equal-sized groups of families sampled for this set. A falling bar on the trait is a case for a slope above, and the spend panel shows what that slope would cost. Families here have at least one hit in the sample; family recalls rest on few reads, so the tail includes sampling noise.</p>
+<h3>Worst families (at least 3 hits)</h3>
+<div class="table-wrap"><table id="worst"></table></div>
+
+<h2>Choices</h2>
+<div class="row">
+  <input id="name" placeholder="Name this policy" aria-label="Policy name">
+  <button type="button" id="save">Save</button>
+  <button type="button" id="export">Download as JSON</button>
+  <button type="button" id="shapes-all">Compare all seed shapes at this policy</button>
+</div>
+<div class="table-wrap"><table id="saved"></table></div>
+<div class="table-wrap"><table id="shape-table"></table></div>
+
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-basic-dist-min@2.35.2/plotly-basic.min.js"></script>
+<script type="module" src="main.js"></script>
+</body>
+</html>

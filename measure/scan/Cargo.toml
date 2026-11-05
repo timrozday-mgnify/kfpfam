@@ -1,0 +1,14 @@
+[package]
+name = "scan"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Whole-Pfam seed measurements for the kfpfam dashboard (brute force, no index)"
+
+[dependencies]
+flate2 = "1"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
