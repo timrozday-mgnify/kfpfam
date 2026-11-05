@@ -7,6 +7,8 @@ pair is two non-overlapping anchors of one query. It is co-seen when one seed se
 the query's distance give or take W residues.
 
 Usage: cooccur.py PREP SEQS.tsv META.tsv ORFS.faa NREADS OUT.json
+Truth is keyed by score against GA: 0 is GA + 30 or more, through 6, below GA - 20; 7 is not reported.
+ORFS may be decoys, so real background has no reported hits to confuse it.
 """
 
 import csv
@@ -17,8 +19,8 @@ from collections import defaultdict
 
 import numpy as np
 
-SHAPES = {"k4": (0, 1, 2, 3), "k5": (0, 1, 2, 3, 4)}
-THRESHOLDS = (0.0, 6.0, 8.0)
+SHAPES = {"k5": (0, 1, 2, 3, 4)}  # ponytail: 4-mers at low T ran for hours; add them if 5-mers show a signal
+THRESHOLDS = (6.0, 8.0)
 WINDOW = 6
 AA = "ACDEFGHIKLMNPQRSTVWY"
 INDEX = {c: i for i, c in enumerate(AA)}
@@ -67,7 +69,14 @@ class Tally:
                 "observed_co_seen": self.observed, "expected_if_independent": self.expected}
 
 
-def evaluate(anchors, occ, nseq, span, tally):
+def group(seen):
+    out = defaultdict(list)
+    for s, p in seen:
+        out[s].append(p)
+    return out
+
+
+def evaluate(anchors, occ, nseq, span, tally, positions):
     tally.single += 1
     has_pair = co = False
     for a in range(len(anchors)):
@@ -78,15 +87,13 @@ def evaluate(anchors, occ, nseq, span, tally):
                 continue
             has_pair = True
             seen_a, seen_b = occ[ka], occ[kb]
-            where_a = defaultdict(list)
-            for s, p in seen_a:
-                where_a[s].append(p)
+            where_a = positions.setdefault(ka, group(seen_a))
             both = set()
             for s, p in seen_b:
                 if s in where_a and any(abs((p - q) - (jb - ja)) <= WINDOW for q in where_a[s]):
                     both.add(s)
             tally.observed += len(both)
-            tally.expected += len({s for s, _ in seen_a}) * len({s for s, _ in seen_b}) / max(nseq, 1)
+            tally.expected += len(where_a) * len(positions.setdefault(kb, group(seen_b))) / max(nseq, 1)
             if both:
                 co = True
     tally.pair += has_pair
@@ -108,7 +115,10 @@ def main():
     assert len(meta) == len(seqs)
     by_model = defaultdict(list)
     for r, s in zip(meta, seqs):
-        by_model[int(r["model"])].append((r["set"], int(r["ga_pass"]), s))
+        m = int(r["model"])
+        delta = float("-inf") if float(r["score"]) <= -900 else float(r["score"]) - float(models[m]["ga"])
+        strength = next(i for i, low in enumerate((30, 10, 0, -5, -10, -20, float("-inf"))) if delta >= low)
+        by_model[m].append((r["set"], strength if delta > float("-inf") else 7, s))
     orfs = []
     with open(orfs_path) as f:
         for line in f:
@@ -145,6 +155,7 @@ def main():
             scores = {}
             score = lambda k: scores.setdefault(k, best_score(lo, k, cols))  # noqa: B023
             nseq = len(family)
+            positions = {}
             nb = next(i for i, (a, z) in enumerate(NSEQ_BINS) if a <= nseq < z)
             for st, ga, ws in truth_words.get(m, []):
                 hits = [(j, k) for j, k in ws if k in occ]
@@ -155,7 +166,7 @@ def main():
                         tallies[key].n += 1
                     if anchors:
                         for key in keys:
-                            evaluate(anchors, occ, nseq, span, tallies[key])
+                            evaluate(anchors, occ, nseq, span, tallies[key], positions)
             per_orf = defaultdict(list)
             for k in occ:
                 for i, j in universe.get(k, ()):
@@ -166,7 +177,7 @@ def main():
                     if not anchors:
                         continue
                     t1 = Tally()
-                    evaluate(anchors, occ, nseq, span, t1)
+                    evaluate(anchors, occ, nseq, span, t1, positions)
                     for key in (("bg", "reads", 0, t, "all"), ("bg", "reads", 0, t, f"nseq{nb}")):
                         tallies[key].n += 1
                         tallies[key].single += t1.single

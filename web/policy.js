@@ -249,6 +249,59 @@ export function barsFor(policy, offsets) {
   return b;
 }
 
+const isTruth = (truth, pairs, g) => {
+  if (truth === 'ga') return !!pairs.ga[g];
+  if (truth === 'e3') return pairs.evalue[g] <= 1e-3;
+  if (truth === 'e10') return pairs.evalue[g] <= 10;
+  return true; // every pair: for fragments, their family even where hmmsearch misses it
+};
+
+export const E_BINS = [
+  { label: '≤ 1e-10', top: 1e-10 }, { label: '1e-10 – 1e-5', top: 1e-5 }, { label: '1e-5 – 1e-3', top: 1e-3 },
+  { label: '1e-3 – 1', top: 1 }, { label: '1 – 10', top: 10 }, { label: '10 – 1000', top: 1000 }, { label: 'not reported', top: Infinity },
+];
+export const SCORE_BINS = [
+  { label: '≥ 60', low: 60 }, { label: '40 – 60', low: 40 }, { label: '30 – 40', low: 30 }, { label: '25 – 30', low: 25 },
+  { label: '20 – 25', low: 20 }, { label: '15 – 20', low: 15 }, { label: '< 15', low: -900 }, { label: 'not reported', low: -Infinity },
+];
+export const GA_BINS = [
+  { label: 'GA + 30 or more', low: 30 }, { label: 'GA + 10 to 30', low: 10 }, { label: 'GA to + 10', low: 0 },
+  { label: 'GA − 5 to GA', low: -5 }, { label: 'GA − 10 to − 5', low: -10 }, { label: 'GA − 20 to − 10', low: -20 },
+  { label: 'below GA − 20', low: -900 }, { label: 'not reported', low: -Infinity },
+];
+export const binsFor = (scheme) => ({ ga: GA_BINS, score: SCORE_BINS, evalue: E_BINS }[scheme]);
+export function binOf(scheme, evalue, score, ga) {
+  if (scheme === 'ga') return GA_BINS.findIndex((b) => (score <= -900 ? -Infinity : score - ga) >= b.low);
+  if (scheme === 'score') return SCORE_BINS.findIndex((b) => score >= b.low);
+  return E_BINS.findIndex((b) => evalue <= b.top);
+}
+
+/** Recall by match strength, and how candidates of a read set and its decoys spread over the bins. */
+export function byStrength(res, policy, d, scheme) {
+  const bins = binsFor(scheme);
+  const out = bins.map((b) => ({ label: b.label, n: 0, weight: 0, ok: 0, real: 0, decoy: 0 }));
+  const want = policy.set || 'all';
+  const { pairs } = d;
+  for (let g = 0; g < pairs.n; g++) {
+    if (want !== 'all' ? pairs.set[g] !== want : !pairs.set[g].startsWith('f')) continue;
+    const b = out[binOf(scheme, pairs.evalue[g], pairs.score[g], d.models.ga[pairs.model[g]])];
+    const w = pairs.weight[g];
+    b.n++; b.weight += w;
+    if (passes(policy, res.truthEv, g, pairs.model[g], res.bars, pairs.best, pairs.bestModel, d.models)) b.ok += w;
+  }
+  const spread = (set, ev, key) => {
+    for (let g = 0; g < set.rows.groups; g++) {
+      const m = set.model[g];
+      if (ev.best[g] && passes(policy, ev, g, m, res.bars, set.bestByGroup, set.bestModelByGroup, d.models)) {
+        out[binOf(scheme, set.evalue[g], set.score[g], d.models.ga[m])][key] += 1 / set.reads;
+      }
+    }
+  };
+  spread(d.bg, res.bgEv, 'real');
+  if (d.decoy) spread(d.decoy, res.decoyEv, 'decoy');
+  return out;
+}
+
 const quantile = (sorted, q) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] : NaN);
 
 /** Recall overall and per family, for pairs of the chosen set and truth. */
@@ -258,8 +311,8 @@ export function recall(policy, pairs, truthRows, ev, bars, models) {
   const want = policy.set || 'all';
   for (let g = 0; g < pairs.n; g++) {
     if (want !== 'all' && pairs.set[g] !== want) continue;
-    if (want === 'all' && pairs.set[g] === 'reads') continue;
-    if (policy.truth === 'ga' ? !pairs.ga[g] : pairs.evalue[g] > 1e-3) continue;
+    if (want === 'all' && !pairs.set[g].startsWith('f')) continue;
+    if (!isTruth(policy.truth, pairs, g)) continue;
     const m = pairs.model[g];
     const pass = passes(policy, ev, g, m, bars, pairs.best, pairs.bestModel, models);
     const w = pairs.weight[g];
@@ -324,7 +377,9 @@ export function evaluate(policy, d) {
   const wRead = d.meta.residuesPerRead - (d.span - 1) * d.meta.orfsPerRead;
   const hits = cost.f * wRead;
   const cand = candidates(policy, d.bg, bgEv, bars, cost, wRead, d.models);
-  return { policy, T, offsets, barOffsets, bars, cost, rec, hits, cand, truthEv, bgEv, wRead };
+  const decoyEv = d.decoy ? groupEvidence(policy, d.decoy.rows, d.decoy.model, T, offsets, d.span) : null;
+  const decoyCand = d.decoy && policy.rule !== 'seed' ? candidates(policy, d.decoy, decoyEv, bars, cost, wRead, d.models).mean : null;
+  return { policy, T, offsets, barOffsets, bars, cost, rec, hits, cand, truthEv, bgEv, decoyEv, decoyCand, wRead };
 }
 
 /** Recall and candidates at other bars, from the same evidence (no re-selection). */

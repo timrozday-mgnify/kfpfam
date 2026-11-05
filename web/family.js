@@ -167,7 +167,7 @@ export async function drawFamily(p, res, d, common) {
   for (let g = 0; g < pairs.n; g++) {
     if (pairs.model[g] !== m) continue;
     if (p.set !== 'all' && pairs.set[g] !== p.set) continue;
-    if (p.set === 'all' && pairs.set[g] === 'reads') continue;
+    if (p.set === 'all' && !pairs.set[g].startsWith('f')) continue;
     hits++;
     let any = false;
     for (let r = d.truth.offs[g]; r < d.truth.offs[g + 1]; r++) {

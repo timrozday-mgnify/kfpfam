@@ -1,6 +1,6 @@
 // @ts-check
 /* global Plotly */
-import { barSweep, estimateMs, evaluate, FEATURES, N_GRID, parseRows } from './policy.js';
+import { barSweep, byStrength, estimateMs, evaluate, FEATURES, N_GRID, parseRows } from './policy.js';
 import { loadCommon, loadShape } from './load.js';
 import { drawFamily, setupFamily } from './family.js';
 
@@ -115,7 +115,7 @@ function summary(p, res) {
   return {
     recall: res.rec.recall, familyMean: res.rec.familyMean, familyP10: res.rec.familyP10, below50: res.rec.below50,
     zero: res.rec.zero, families: res.rec.families.length, solidFamilies: res.rec.solidFamilies,
-    candidates: res.cand.mean, measured: res.cand.measured,
+    candidates: res.cand.mean, measured: res.cand.measured, decoy: res.decoyCand,
     gb: (res.cost.entries * c.bytes) / 1e9, hits: res.hits, ms, speedup: common.hmmsearchMs / ms,
   };
 }
@@ -128,6 +128,7 @@ function readouts(s) {
     item('Family recall, mean', pct(s.familyMean), `${s.families} families`),
     item('Families under 50%', pct(s.below50), `${pct(s.zero)} lose every hit`),
     item('Candidate models per read', compact(s.candidates), s.measured ? `of ${common.models.acc.length}; measured` : 'model, not measured'),
+    item('Decoy candidates per read', s.decoy == null ? '–' : compact(s.decoy), s.decoy == null ? '' : `precision about ${pct(Math.max(0, 1 - s.decoy / Math.max(s.candidates, 1e-9)))}`),
     item('Index', size(s.gb), 'gate ≤ 16 GB', s.gb <= 16),
     item('Seed hits per read', compact(s.hits), 'from the background model'),
     item('Estimated time per read', `${compact(s.ms)} ms`, `hmmsearch ${common.hmmsearchMs} ms measured`),
@@ -178,6 +179,25 @@ function plotSweep(p) {
     setTimeout(() => step(i + 1), 0);
   };
   step(0);
+}
+
+function plotStrength(p, res, d) {
+  const scheme = el('scheme').value;
+  const bins = byStrength(res, p, d, scheme);
+  const labels = bins.map((b) => b.label);
+  const traces = [{ x: labels, y: bins.map((b) => (b.weight ? b.ok / b.weight : null)), mode: 'lines+markers', name: 'This policy', line: { color: COLORS.main, width: 3 } }];
+  for (const t of common.byBin?.tools || []) {
+    const series = t.recall?.[p.set === 'all' ? 'fragments' : p.set]?.[scheme];
+    if (series) traces.push({ x: labels, y: series, mode: 'lines+markers', name: t.tool, line: { dash: 'dot' } });
+  }
+  Plotly.react('plot-strength', traces, { ...LAYOUT, title: { text: 'Recall by match strength', font: { size: 13 } }, yaxis: { title: 'Recall', range: [0, 1.02] }, xaxis: { type: 'category', tickangle: -30, automargin: true } }, { responsive: true });
+  const prec = (b) => (b.real > 0 ? Math.max(0, 1 - b.decoy / b.real) : null);
+  Plotly.react('plot-precision', [
+    { x: labels, y: bins.map((b) => b.real), type: 'bar', name: 'Reads', marker: { color: COLORS.main } },
+    { x: labels, y: bins.map((b) => b.decoy), type: 'bar', name: 'Reversed reads', marker: { color: COLORS.second } },
+  ], { ...LAYOUT, barmode: 'group', title: { text: 'Candidates per read, by how hmmsearch rates them', font: { size: 13 } }, yaxis: { title: 'Candidates per read', type: 'log' }, xaxis: { type: 'category', tickangle: -30, automargin: true } }, { responsive: true });
+  el('strength-table').innerHTML = `<tr><th>Bin</th><th>Hits in sample</th><th>Recall</th><th>Candidates / read</th><th>Decoy candidates / read</th><th>Precision (est.)</th></tr>${
+    bins.map((b) => `<tr><td>${b.label}</td><td>${b.n}</td><td>${b.weight ? pct(b.ok / b.weight) : '–'}</td><td>${compact(b.real)}</td><td>${compact(b.decoy)}</td><td>${prec(b) === null ? '–' : pct(prec(b))}</td></tr>`).join('')}`;
 }
 
 function familyRows(res) {
@@ -254,6 +274,7 @@ async function update() {
     : ['anchors', 'either', 'both'].includes(p.rule) && (p.method !== 'lr' || p.target !== 'fixed' || p.value < floor)
       ? `Background anchors on weak diagonals were kept only at ≥ ${floor} bits for this seed, so candidates read low for anchors below that.` : '';
   plotBars(p, res, d);
+  plotStrength(p, res, d);
   plotFamilies(res);
   drawFamily(p, res, d, common);
   el('status').textContent = `Evaluated in ${(performance.now() - t0).toFixed(0)} ms; ${d.truth.rows.toLocaleString()} seeds in ${common.pairs.n.toLocaleString()} hits, ${d.bg.rows.rows.toLocaleString()} background seeds over ${common.meta.reads} reads.`;
@@ -295,6 +316,7 @@ async function main() {
   el('method').addEventListener('change', () => setValueRange(el('method').value));
   el('controls').addEventListener('input', update);
   feat.addEventListener('input', update);
+  el('scheme').addEventListener('input', update);
   el('save').onclick = () => {
     const p = policy();
     const name = el('name').value || `${p.shape} ${p.method} ${saved.length + 1}`;

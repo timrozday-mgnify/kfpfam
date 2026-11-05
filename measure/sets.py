@@ -3,8 +3,8 @@
 sets.py fragments DOMTBL[,DOMTBL] PROTEINS.faa OUT PER_FAMILY
     Fragments of GA-passing domains: 50 aa (150 bp) and 33 aa (100 bp), up to PER_FAMILY per
     family and length, so rare families count. Each has a weight restoring the family's abundance.
-sets.py pairs FRAGMENTS_META FRAG_DOMTBL READS_ORFS.faa READS_DOMTBL MODELS.tsv OUT
-    The (sequence, model) pairs hmmsearch reports at E <= 1e-3 or GA: what a pre-filter must keep.
+sets.py pairs FRAGMENTS_META FRAG_DOMTBL FRAGS.faa READS_ORFS.faa READS_DOMTBL MODELS.tsv OUT
+    The (sequence, model) pairs to score a filter on, across match strength.
 """
 
 import csv
@@ -68,14 +68,27 @@ def fragments(tables, proteins, out, per_family):
     print(n, "fragments")
 
 
-def pairs(meta_path, frag_table, frags, orfs, reads_table, models, out, max_reads=3000, per_family=3):
+def e_bin(evalue):
+    for i, top in enumerate((1e-10, 1e-5, 1e-3, 1, 10, 1000)):
+        if evalue <= top:
+            return i
+    return 6
+
+
+def pairs(meta_path, frag_table, frags, orfs, reads_table, models, out, max_per_bin=1500, per_family=3):
+    """Pairs to score a filter on, across match strength.
+
+    Fragments: their source family, up to per_family reported by hmmsearch and one it misses. Reads:
+    every model hmmsearch reports down to the table's E-value, capped per E-value bin. Weights
+    restore the abundance the caps removed. A miss has E-value 1e9 and score -999.
+    """
     rng = random.Random(23)
     with open(models) as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
     index = {r["acc"]: i for i, r in enumerate(rows)}
     ga = [float(r["ga"]) for r in rows]
     with open(meta_path) as f:
-        meta = {r["id"]: r for r in csv.DictReader(f, delimiter="\t")}
+        meta = list(csv.DictReader(f, delimiter="\t"))
     seqs = dict(fasta(frags))
     seqs.update(fasta(orfs))
 
@@ -87,29 +100,36 @@ def pairs(meta_path, frag_table, frags, orfs, reads_table, models, out, max_read
                 best[key] = (evalue, score)
         return best
 
+    frag_hits = hits(frag_table)
     with open(out + ".seqs.tsv", "w") as s, open(out + ".meta.tsv", "w") as o:
         o.write("set\tquery\tmodel\tweight\tevalue\tscore\tga_pass\n")
-        by = defaultdict(list)
-        for (q, m), (e, sc) in hits(frag_table).items():
-            r = meta[q]
-            if index[r["acc"]] == m and (e <= 1e-3 or sc >= ga[m]):
-                by[(r["length"], m)].append((q, float(r["weight"]), e, sc))
+        found, missed = defaultdict(list), defaultdict(list)
+        for r in meta:
+            m = index[r["acc"]]
+            h = frag_hits.get((r["id"], m))
+            (found if h else missed)[(r["length"], m)].append((r["id"], float(r["weight"]), h))
         n = 0
-        for (length, m), items in sorted(by.items()):
+        for group, cap in ((found, per_family), (missed, 1)):
+            for (length, m), items in sorted(group.items()):
+                rng.shuffle(items)
+                kept = items[:cap]
+                scale = len(items) / len(kept)
+                for q, w, h in kept:
+                    e, sc = h if h else (1e9, -999.0)
+                    s.write(f"{seqs[q]}\t{m}\n")
+                    o.write(f"f{length}\t{q}\t{m}\t{w * scale:.2f}\t{e:.3g}\t{sc}\t{int(sc >= ga[m])}\n")
+                    n += 1
+        print(n, "fragment pairs")
+        bins = defaultdict(list)
+        for k, v in hits(reads_table).items():
+            bins[e_bin(v[0])].append((k, v))
+        for b, items in sorted(bins.items()):
             rng.shuffle(items)
-            kept = items[:per_family]
-            scale = len(items) / len(kept)
-            for q, w, e, sc in kept:
+            kept = items[:max_per_bin]
+            print("reads bin", b, len(items), "kept", len(kept))
+            for (q, m), (e, sc) in kept:
                 s.write(f"{seqs[q]}\t{m}\n")
-                o.write(f"f{length}\t{q}\t{m}\t{w * scale:.2f}\t{e:.3g}\t{sc}\t{int(sc >= ga[m])}\n")
-                n += 1
-        print(n, "fragment pairs,", len({k[1] for k in by}), "families")
-        rh = [(k, v) for k, v in hits(reads_table).items() if v[0] <= 1e-3 or v[1] >= ga[k[1]]]
-        rng.shuffle(rh)
-        print(len(rh), "read pairs available")
-        for (q, m), (e, sc) in rh[:max_reads]:
-            s.write(f"{seqs[q]}\t{m}\n")
-            o.write(f"reads\t{q}\t{m}\t1\t{e:.3g}\t{sc}\t{int(sc >= ga[m])}\n")
+                o.write(f"reads\t{q}\t{m}\t{len(items) / len(kept):.2f}\t{e:.3g}\t{sc}\t{int(sc >= ga[m])}\n")
 
 
 if __name__ == "__main__":

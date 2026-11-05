@@ -44,13 +44,41 @@ export async function loadCommon() {
     models.z[f] = Float32Array.from(v, (x) => (x - mean) / sd);
   }
   const pairs = { ...rawPairs, n: rawPairs.model.length, model: Uint16Array.from(rawPairs.model), weight: Float32Array.from(rawPairs.weight), best: Float32Array.from(rawPairs.best), bestModel: Uint16Array.from(rawPairs.bestModel) };
-  return { models, pairs, meta, baselines: baselines.tools, hmmsearchMs: baselines.hmmsearch_ms_per_read, provenance: baselines.provenance };
+  return { models, pairs, meta, baselines: baselines.tools, byBin: baselines.byBin, hmmsearchMs: baselines.hmmsearch_ms_per_read, provenance: baselines.provenance };
+}
+
+/** Background rows per (read, model), with each one's rating by hmmsearch if it was reported. */
+function backgroundSet(rows, g, reads, best, bestModel, hits) {
+  const read = new Uint16Array(rows.groups);
+  const model = new Uint16Array(rows.groups);
+  const bestByGroup = new Float32Array(rows.groups);
+  const bestModelByGroup = new Uint16Array(rows.groups);
+  const evalue = new Float32Array(rows.groups).fill(1e9);
+  const score = new Float32Array(rows.groups).fill(-999);
+  const at = new Map();
+  for (let i = 0; i < rows.groups; i++) {
+    read[i] = g[i * 2];
+    model[i] = g[i * 2 + 1];
+    bestByGroup[i] = best[read[i]];
+    bestModelByGroup[i] = bestModel[read[i]];
+    at.set(read[i] * 40000 + model[i], i);
+  }
+  for (const [r, m, e, s] of hits || []) {
+    const i = at.get(r * 40000 + m);
+    if (i !== undefined) { evalue[i] = e; score[i] = s; }
+  }
+  return { rows, read, model, reads, bestByGroup, bestModelByGroup, evalue, score };
 }
 
 export async function loadShape(shape, common) {
   const [truthBuf, bgBuf, groupBuf, tabBuf, wordsBuf, strataBuf] = await Promise.all(
     [`${shape}.rows.gz`, `${shape}.bg.gz`, `${shape}.bggroups.gz`, `${shape}.tab.gz`, `${shape}.words.bin`, `${shape}.strata.bin`].map(bytes),
   );
+  let decoy = null;
+  if (common.meta.decoyHits) {
+    const [dBuf, dGroups] = await Promise.all([`${shape}.decoy.gz`, `${shape}.decoygroups.gz`].map(bytes));
+    decoy = backgroundSet(parseRows(dBuf), new Uint16Array(dGroups), common.meta.reads, common.meta.decoyBest, common.meta.decoyBestModel, common.meta.decoyHits);
+  }
   const nm = common.models.acc.length;
   const ng = 21 + 27;
   const logs = new Int16Array(tabBuf, 0, nm * ng * 2);
@@ -77,23 +105,13 @@ export async function loadShape(shape, common) {
       return { n: strata[(fi * 21 + ti) * 2], f: strata[(fi * 21 + ti) * 2 + 1] };
     },
   };
-  const rows = parseRows(bgBuf);
-  const g = new Uint16Array(groupBuf);
-  const read = new Uint16Array(rows.groups);
-  const model = new Uint16Array(rows.groups);
-  const bestByGroup = new Float32Array(rows.groups);
-  const bestModelByGroup = new Uint16Array(rows.groups);
-  for (let i = 0; i < rows.groups; i++) {
-    read[i] = g[i * 2];
-    model[i] = g[i * 2 + 1];
-    bestByGroup[i] = common.meta.readBest[read[i]];
-    bestModelByGroup[i] = common.meta.readBestModel[read[i]];
-  }
+  const bg = backgroundSet(parseRows(bgBuf), new Uint16Array(groupBuf), common.meta.reads, common.meta.readBest, common.meta.readBestModel, common.meta.bgHits);
   const shapeCols = common.meta.shapes[shape];
   return {
     tab,
     truth: parseRows(truthBuf),
-    bg: { rows, read, model, reads: common.meta.reads, bestByGroup, bestModelByGroup },
+    bg,
+    decoy,
     span: shapeCols[shapeCols.length - 1] + 1,
   };
 }
