@@ -727,6 +727,72 @@ fn best(pf: &Pfam, input: &str, out: &str) {
         writeln!(o, "{id}\t{s:.2}\t{m}").unwrap();
     }
 }
+/// Best local alignment of a sequence to a model, in bits, with affine gaps. Full matrix: real use
+/// would stay near the seed and use SIMD, so this is an upper bound on cost and sensitivity.
+fn gapped_score(pf: &Pfam, m: usize, f: &[u8], open: f32, extend: f32, h: &mut Vec<f32>, del: &mut Vec<f32>) -> f32 {
+    let (a, b) = pf.range(m);
+    let cols = b - a;
+    h.clear();
+    h.resize(cols + 1, 0.0);
+    del.clear();
+    del.resize(cols + 1, f32::NEG_INFINITY);
+    let mut best = 0.0f32;
+    for &r in f {
+        let (mut diag, mut left, mut ins) = (0.0f32, 0.0f32, f32::NEG_INFINITY);
+        for c in 1..=cols {
+            let up = h[c];
+            del[c] = (up - open).max(del[c] - extend);
+            ins = (left - open).max(ins - extend);
+            let v = (diag + pf.lo[(a + c - 1) * 21 + r as usize]).max(del[c]).max(ins).max(0.0);
+            diag = up;
+            h[c] = v;
+            left = v;
+            if v > best {
+                best = v;
+            }
+        }
+    }
+    best
+}
+/// Input: id, model, sequence. Output: id, model, then the score at each (open, extend) in bits.
+fn gapped(pf: &Pfam, input: &str, out: &str) {
+    const NONE: f32 = 1e6;
+    const GAPS: [(f32, f32); 5] = [(NONE, NONE), (8.0, 2.0), (6.0, 1.0), (4.0, 1.0), (3.0, 0.5)];
+    let lines = read_tsv(input);
+    let jobs: Vec<(usize, Vec<u8>)> = lines.iter().map(|l| (l[1].parse().unwrap(), encode(l[2].as_bytes()))).collect();
+    // With gaps barred this is the best ungapped diagonal; gaps can only raise it
+    for (m, f) in jobs.iter().step_by((jobs.len() / 500).max(1)) {
+        let (a, b) = pf.range(*m);
+        let mut ungapped = 0.0f32;
+        for d in (1 - f.len() as i64)..((b - a) as i64) {
+            let v: Vec<f32> = (0..f.len()).filter_map(|x| {
+                let c = d + x as i64;
+                (c >= 0 && (c as usize) < b - a).then(|| pf.lo[(a + c as usize) * 21 + f[x] as usize])
+            }).collect();
+            ungapped = ungapped.max(kadane(&v));
+        }
+        let (mut h, mut del) = (vec![], vec![]);
+        let barred = gapped_score(pf, *m, f, NONE, NONE, &mut h, &mut del);
+        assert!((barred - ungapped).abs() < 1e-2, "{barred} {ungapped}");
+        assert!(gapped_score(pf, *m, f, 3.0, 0.5, &mut h, &mut del) >= barred - 1e-3);
+    }
+    let mut cols = vec![];
+    for (open, extend) in GAPS {
+        let t0 = std::time::Instant::now();
+        let v: Vec<f32> = jobs.par_iter().map_init(|| (vec![], vec![]), |(h, del), (m, f)| gapped_score(pf, *m, f, open, extend, h, del)).collect();
+        eprintln!("gapped {open} {extend}: {} sequence-model pairs, {:.1}s wall", v.len(), t0.elapsed().as_secs_f32());
+        cols.push(v);
+    }
+    let mut o = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        o += &format!("{}\t{}", l[0], l[1]);
+        for c in &cols {
+            o += &format!("\t{:.2}", c[i]);
+        }
+        o.push('\n');
+    }
+    fs::write(out, o).unwrap();
+}
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let pf = Pfam::load(&a[2]);
@@ -735,6 +801,7 @@ fn main() {
         "truth" => truth(&pf, &a[2], &a[3], &a[4]),
         "bg" => background(&pf, &a[2], &a[3], a[4].parse().unwrap(), &a[5]),
         "best" => best(&pf, &a[3], &a[4]),
-        _ => panic!("tables | truth | bg | best"),
+        "gapped" => gapped(&pf, &a[3], &a[4]),
+        _ => panic!("tables | truth | bg | best | gapped"),
     }
 }
