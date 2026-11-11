@@ -3,6 +3,8 @@
 import { barSweep, byStrength, estimateMs, evaluate, FEATURES, N_GRID, parseRows } from './policy.js';
 import { loadCommon, loadReal, loadShape, withSet } from './load.js';
 import { drawFamily, setupFamily } from './family.js';
+import { setupSketch } from './sketch.js';
+import { setupPromiscuous } from './promiscuous.js';
 
 const el = (id) => /** @type {HTMLInputElement} */ (document.getElementById(id));
 const compact = (x) => (x >= 1e4 || (x > 0 && x < 0.01) ? x.toExponential(1).replace('e+', 'e') : x >= 100 ? x.toFixed(0) : x.toPrecision(3));
@@ -342,6 +344,8 @@ async function main() {
   setupFamily(common, update);
   el('worst').addEventListener('click', (e) => { const tr = /** @type {HTMLElement} */ (e.target).closest('tr'); if (tr?.dataset.model) { el('family').value = common.models.name[+tr.dataset.model]; update(); el('plot-family').scrollIntoView(); } });
   drawSaved();
+  setupSketch();
+  setupPromiscuous();
   await update();
 }
 main().catch((e) => { el('status').textContent = `Failed: ${e.message}`; throw e; });

@@ -26,6 +26,7 @@
   .readouts small { color: #777; }
   .plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 8px; }
   .plots > div { height: 380px; min-width: 0; }
+  .plots.tall > div { height: 500px; }
   p.note { color: #666; max-width: 75em; }
   .table-wrap { overflow-x: auto; }
   table { border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 8px 0; }
@@ -133,6 +134,36 @@
 <div class="table-wrap"><table id="strength-table"></table></div>
 <p class="note">Recall in each bin, for the set chosen above. "Not reported" fragments are from a family where hmmsearch found nothing, so recall there is what hmmsearch itself lacks. Right: where each read's candidates fall, against the same reads reversed. A weak or unreported candidate may still be true, so precision is estimated from decoys: 1 − decoy / real, per bin, not from hmmsearch's verdict. On the real metagenome, reported hits come from all 50,000 reads hmmsearch rated and their 50,000 reversed copies; the "not reported" bin needs a scan over every model, so it comes from 300 of those reads.</p>
 
+<h2>Rejecting promiscuous k-mers (k4 T7, per-read pseudo-alignment)</h2>
+<p class="note">Most hits are noise, so dropping the k-mers that make the most hits could save time, if each true pair keeps another seed. A pair survives when any seed on a diagonal at the bar is not rejected. Measured by <code>filter search</code> on 50,000 reads of ERR10889147 and the same reads reversed, against hmmsearch. Rules from the index and background need no reads; the sample and repeat rules run at query time. Independent of the policy above.</p>
+<div class="row">
+  <label>Bar <select id="prom-bar"></select></label>
+  <label>Recall bin <select id="prom-bin"></select></label>
+</div>
+<div class="plots tall">
+  <div id="plot-prom-recall"></div>
+  <div id="plot-prom-bray"></div>
+</div>
+<p class="note">"Speed, seeding" is 1 ÷ (1 − hits removed), for the seeding stage only. Bray-Curtis compares GA hits per family with no rejection; it shows whether rejection shifts a profile, not only how much recall it costs.</p>
+<div class="table-wrap"><table id="prom-table"></table></div>
+
+<h2>Whole-sample sketch: one k-mer set per sample, no read structure</h2>
+<p class="note">Instead of aligning each read, all of a sample's k-mers go into one set, and a model is kept for <code>hmmsearch</code> or nail when the set holds a k-mer scoring at or above the bar against one of its windows. Independent of the policy above. Measured with <code>filter sketch</code> on ERR10889147; the bound lumps read-level diagonal or gapped scores per model, which no k-mer set can beat.</p>
+<div class="row">
+  <label>Depth <select id="sketch-depth"><option value="sub">50,000 reads (hmmsearch truth)</option><option value="all">All 1.07 M reads (nail truth)</option></select></label>
+  <label>Rule <select id="sketch-rule"><option value="best">Best k-mer score ≥ bar</option><option value="null">Best score less the model's score on reversed reads ≥ bar</option></select></label>
+  <label>Recall of <select id="sketch-by"><option value="recall">Models present at GA</option><option value="recall5">Models with ≥ 5 GA hits</option><option value="hits">GA hits</option></select></label>
+</div>
+<div class="readouts" id="sketch-readouts"></div>
+<div class="plots tall">
+  <div id="plot-sketch-trade"></div>
+  <div id="plot-sketch-noise"></div>
+</div>
+<p class="note">Lumping multiplies the search space: every sample residue against every column of a model, about 2<sup>30</sup> at 50,000 reads and 2<sup>34</sup> at 1 M. A chance match reaches about log₂ of that at any k, so a true hit has to beat it with one k-mer, and a family seen in few reads is no louder than a family seen in many. Longer k catches more of a hit's score; it does not lower the noise.</p>
+<div class="table-wrap"><table id="sketch-table"></table></div>
+<h3>Speed</h3>
+<div class="table-wrap"><table id="sketch-cost"></table></div>
+
 <h2>Is every Pfam served?</h2>
 <div class="row">
   <label>Trait <select id="feature"></select></label>
@@ -155,7 +186,7 @@
   <label>Read length, aa <select id="family-read"><option value="50">50 (150 bp)</option><option value="33">33 (100 bp)</option></select></label>
 </div>
 <div class="readouts" id="family-readouts"></div>
-<div id="plot-family" style="height:760px"></div>
+<div id="plot-family" style="height:960px"></div>
 <p class="note" id="family-note"></p>
 <div class="table-wrap"><table id="family-kmers"></table></div>
 

@@ -1,7 +1,7 @@
 // @ts-check
 /* global Plotly */
 // One family: the score that chooses its k-mers, along its columns, and where the anchors fall.
-import { loadProfile } from './load.js';
+import { loadProfile, loadStructure } from './load.js';
 import { selector } from './policy.js';
 
 const A = 'ACDEFGHIKLMNPQRSTVWY';
@@ -10,6 +10,9 @@ const total = Q.reduce((a, b) => a + b, 0);
 for (let i = 0; i < 20; i++) Q[i] /= total;
 const el = (id) => /** @type {HTMLInputElement} */ (document.getElementById(id));
 const STEP = 0.5; // bits per bin of a window's score distribution
+const SS_NAMES = ['helix', 'strand', 'coil', 'no chain'];
+const SS_COLORS = ['#c8553d', '#3366aa', '#d4d4d4', '#ffffff'];
+const SS_LETTERS = 'HEC-';
 const compact = (x) => (x >= 1e4 || (x > 0 && x < 0.01) ? x.toExponential(1).replace('e+', 'e') : x >= 100 ? x.toFixed(0) : x.toPrecision(3));
 
 /**
@@ -123,7 +126,7 @@ export async function drawFamily(p, res, d, common) {
   if (m !== current) clickedWindow = null;
   current = m;
   const mine = ++token;
-  const lo = await loadProfile(m, models);
+  const [lo, ss] = await Promise.all([loadProfile(m, models), loadStructure(m, models)]);
   if (mine !== token) return;
   const length = models.length[m];
   const cols = common.meta.shapes[p.shape];
@@ -205,6 +208,11 @@ export async function drawFamily(p, res, d, common) {
   }
   if (!starts) { starts = 1; one = has.some(Boolean) ? 1 : 0; }
   const item = (title, value, sub) => `<div>${title}<b>${value}</b><small>${sub || ''}</small></div>`;
+  const gor = ss && Array.from({ length }, (_, c) => ss[c * 5]);
+  const dssp = ss && Array.from({ length }, (_, c) => ss[c * 5 + 1]);
+  const share = (x, s) => Math.round((100 * x.filter((v) => v === s).length) / Math.max(length, 1));
+  const covered = ss ? dssp.filter((v) => v < 3).length : 0;
+  const agree = ss ? dssp.filter((v, c) => v < 3 && v === gor[c]).length : 0;
   el('family-readouts').innerHTML = [
     item(models.name[m], models.acc[m], `${length} columns; GA ${models.ga[m]}; ${models.nseq[m]} seed seqs${models.clan[m] ? `; ${models.clan[m]}` : ''}`),
     item('K-mers kept', compact(sum), `${compact(sum / Math.max(wins, 1))} per window`),
@@ -213,6 +221,10 @@ export async function drawFamily(p, res, d, common) {
     item(`${L} aa reads with an anchor`, `${((100 * one) / starts).toFixed(0)}%`, 'of positions on the model'),
     item(`${L} aa reads with two`, `${((100 * two) / starts).toFixed(0)}%`, 'non-overlapping, ignoring indels'),
     item('Real hits seeded', hits ? `${seeded} of ${hits}` : 'no hits', 'in the chosen sequences'),
+    ...(ss ? [
+      item('GOR structure', `${share(gor, 0)} / ${share(gor, 1)} / ${share(gor, 2)}%`, 'helix / strand / coil, from the emissions'),
+      item('GOR matches DSSP', covered ? `${((100 * agree) / covered).toFixed(0)}%` : 'no chain', covered ? `of the ${covered} columns a PDB chain covers` : 'no PDB chain at GA in this family'),
+    ] : []),
   ].join('');
 
   // Score distribution per window, as a heatmap; the policy's line through it.
@@ -233,18 +245,37 @@ export async function drawFamily(p, res, d, common) {
     { x: xs, y: anchorsKept, type: 'bar', name: 'Real seeds kept (anchors)', marker: { color: '#2a9d5c' }, yaxis: 'y3' },
     { x: Array.from(info, (_, c) => c + 1), y: Array.from(info), type: 'bar', name: 'Information per column', marker: { color: '#999' }, yaxis: 'y4' },
   ];
+  if (ss) {
+    const columns = Array.from({ length }, (_, c) => c + 1);
+    for (const s of [0, 1, 2]) {
+      traces.push({ x: columns, y: columns.map((c) => ss[(c - 1) * 5 + 2 + s] / 255), name: `P(${SS_NAMES[s]})`, mode: 'none', stackgroup: 'ss', fillcolor: SS_COLORS[s], yaxis: 'y5', hovertemplate: `column %{x}<br>P(${SS_NAMES[s]}) %{y:.2f}<extra></extra>` });
+    }
+    const rows = [dssp, gor];
+    traces.push({
+      type: 'heatmap', x: columns, y: ['DSSP', 'GOR'], z: rows, zmin: 0, zmax: 3, yaxis: 'y6', showscale: false, xgap: 0, ygap: 2,
+      colorscale: SS_COLORS.flatMap((color, i) => [[i / 4, color], [(i + 1) / 4, color]]),
+      text: rows.map((r) => r.map((v) => SS_NAMES[v])), hovertemplate: 'column %{x}<br>%{y}: %{text}<extra></extra>',
+    });
+  }
+  const domains = ss
+    ? { y: [0.68, 1], y2: [0.52, 0.66], y3: [0.36, 0.5], y4: [0.23, 0.34], y5: [0.08, 0.21], y6: [0, 0.06] }
+    : { y: [0.62, 1], y2: [0.42, 0.59], y3: [0.2, 0.39], y4: [0, 0.17] };
   Plotly.react('plot-family', traces, {
     margin: { t: 16, r: 16, b: 44, l: 64 }, font: { size: 12 }, barmode: 'overlay', hovermode: 'closest',
-    legend: { orientation: 'h', y: -0.08 },
-    xaxis: { title: 'Model column (window start)', range: [0, length + 1], anchor: 'y4' },
-    yaxis: { domain: [0.62, 1], title: yLabel },
-    yaxis2: { domain: [0.42, 0.59], title: 'K-mers kept', type: 'log' },
-    yaxis3: { domain: [0.2, 0.39], title: 'Seeds in real hits' },
-    yaxis4: { domain: [0, 0.17], title: 'Bits' },
+    legend: { orientation: 'h', y: ss ? -0.09 : -0.08 },
+    xaxis: { title: 'Model column (window start)', range: [0, length + 1], anchor: ss ? 'y6' : 'y4' },
+    yaxis: { domain: domains.y, title: yLabel },
+    yaxis2: { domain: domains.y2, title: 'K-mers kept', type: 'log' },
+    yaxis3: { domain: domains.y3, title: 'Seeds in real hits' },
+    yaxis4: { domain: domains.y4, title: 'Bits' },
+    ...(ss ? {
+      yaxis5: { domain: domains.y5, title: 'GOR', range: [0, 1], tickvals: [0, 1] },
+      yaxis6: { domain: domains.y6, tickfont: { size: 10 } },
+    } : {}),
   }, { responsive: true });
   const plot = /** @type {any} */ (document.getElementById('plot-family'));
   if (plot.removeAllListeners) plot.removeAllListeners('plotly_click');
-  lastArgs = { lo, cols, wins, res, m, p, entries };
+  lastArgs = { lo, cols, wins, res, m, p, entries, gor, dssp, span };
   plot.on('plotly_click', (e) => { clickedWindow = Math.round(e.points[0].x) - 1; showKmers(); });
   if (clickedWindow === null || clickedWindow >= wins) {
     let best = 0;
@@ -254,14 +285,16 @@ export async function drawFamily(p, res, d, common) {
   showKmers();
   el('family-note').textContent = p.method === 'words'
     ? 'Seed-alignment words have no fixed window, so the kept-k-mer track is empty; the anchors track still shows where they land. Click a window for its top k-mers.'
-    : `${byProb ? 'Selection here ranks by emission probability.' : 'Selection here ranks by log-odds: k-mers above the line are kept.'} Hash sparsity divides the kept counts, and an anchor track shows the same thinning in real sequences. Click a window for its top k-mers.`;
+    : `${byProb ? 'Selection here ranks by emission probability.' : 'Selection here ranks by log-odds: k-mers above the line are kept.'} Hash sparsity divides the kept counts, and an anchor track shows the same thinning in real sequences. Click a window for its top k-mers.${ss ? ' Structure: GOR on the emissions, from tables trained without this clan, against DSSP from PDB chains aligned at GA; white is a column no chain covers.' : ''}`;
 }
 
 function showKmers() {
-  const { lo, cols, wins, res, m, p, entries } = lastArgs;
+  const { lo, cols, wins, res, m, p, entries, gor, dssp, span } = lastArgs;
   if (!wins) { el('family-kmers').innerHTML = ''; return; }
   const w = clickedWindow;
   const rows = topKmers(lo, w, cols, 12);
   const T = p.method === 'lr' ? res.T[m] : null;
-  el('family-kmers').innerHTML = `<tr><th colspan="4">Window at column ${w + 1}: top k-mers, of ${compact(entries[w])} kept</th></tr><tr><th>K-mer</th><th>Log-odds</th><th>−log₂ P</th><th>Kept by T</th></tr>${rows.map((r) => `<tr><td><code>${r.kmer}</code></td><td>${r.score.toFixed(2)}</td><td>${r.logp.toFixed(1)}</td><td>${T === null ? '–' : r.score >= T ? 'yes' : 'no'}</td></tr>`).join('')}`;
+  const letters = (x) => x.slice(w, w + span).map((v) => SS_LETTERS[v]).join('');
+  const structure = gor ? `; GOR <code>${letters(gor)}</code>, DSSP <code>${letters(dssp)}</code>` : '';
+  el('family-kmers').innerHTML = `<tr><th colspan="4">Window at column ${w + 1}: top k-mers, of ${compact(entries[w])} kept${structure}</th></tr><tr><th>K-mer</th><th>Log-odds</th><th>−log₂ P</th><th>Kept by T</th></tr>${rows.map((r) => `<tr><td><code>${r.kmer}</code></td><td>${r.score.toFixed(2)}</td><td>${r.logp.toFixed(1)}</td><td>${T === null ? '–' : r.score >= T ? 'yes' : 'no'}</td></tr>`).join('')}`;
 }

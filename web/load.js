@@ -19,20 +19,33 @@ async function bytes(name) {
 }
 const json = async (name) => JSON.parse(new TextDecoder().decode(await bytes(name)));
 
-/** A model's log-odds in bits, length x 20, from its piece of the profile. */
+/** A model's rows from a directory of pieces fetched on demand, `width` bytes per column. */
 const pieces = new Map();
-export async function loadProfile(m, models) {
+async function loadPiece(dir, width, m, models) {
   const n = models.acc.length;
   const CHUNKS = 200;
   let c = Math.floor((m * CHUNKS) / n);
   while (Math.floor(((c + 1) * n) / CHUNKS) <= m) c++;
   while (Math.floor((c * n) / CHUNKS) > m) c--;
-  if (!pieces.has(c)) pieces.set(c, new Int8Array(await bytes(`profile/${c}.bin.gz`)));
-  const piece = pieces.get(c);
+  const key = `${dir}/${c}`;
+  if (!pieces.has(key)) pieces.set(key, new Uint8Array(await bytes(`${dir}/${c}.bin.gz`)));
+  const piece = pieces.get(key);
   let at = 0;
   for (let i = Math.floor((c * n) / CHUNKS); i < m; i++) at += models.length[i];
-  return piece.subarray(at * 20, (at + models.length[m]) * 20);
+  return piece.subarray(at * width, (at + models.length[m]) * width);
 }
+
+/** A model's log-odds in quarter bits, length x 20. */
+export async function loadProfile(m, models) {
+  const u = await loadPiece('profile', 20, m, models);
+  return new Int8Array(u.buffer, u.byteOffset, u.length);
+}
+
+/**
+ * A model's secondary structure, length x 5: GOR class, DSSP class (0 H, 1 E, 2 C, 3 no chain),
+ * then P(H), P(E), P(C) x 255. Null until `ss_kmers.py web` has run.
+ */
+export const loadStructure = (m, models) => loadPiece('ss', 5, m, models).catch(() => null);
 
 export async function loadCommon() {
   const [models, rawPairs, meta, baselines] = await Promise.all([json('models.json.gz'), json('pairs.json.gz'), json('meta.json'), json('baselines.json')]);
