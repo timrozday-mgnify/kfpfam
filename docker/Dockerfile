@@ -1,4 +1,4 @@
-# hmmsearch (truth), MMseqs2 and nail (baselines). Build: docker build -t kfpfam-tools docker/
+# hmmsearch (truth), MMseqs2 and nail (baselines). Build: docker build --platform linux/arm64 -t kfpfam-tools docker/
 FROM debian:trixie-slim
 ARG ARCH=arm64
 ARG NAIL_ARCH=aarch64
@@ -10,7 +10,7 @@ RUN for v in 15-6f452 18-8cc5c; do mkdir -p /opt/mmseqs-$v \
 RUN mkdir -p /opt/nail/bin \
     && curl -fsSL https://github.com/TravisWheelerLab/nail/releases/download/nail-v0.7.1/nail-$NAIL_ARCH-unknown-linux-gnu.tar.gz \
      | tar xz -C /opt/nail \
-    && find /opt/nail -type f -name nail -exec mv {} /opt/nail/bin/ \; \
+    && mv "$(find /opt/nail -type f \( -name nail -o -name 'nail-*' \) | head -1)" /opt/nail/bin/nail \
     && chmod +x /opt/nail/bin/nail
 ENV PATH=/opt/mmseqs-18-8cc5c/bin:/opt/nail/bin:$PATH
 WORKDIR /work

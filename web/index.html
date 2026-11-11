@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kfpfam explorer</title>
+<style>
+  [hidden] { display: none !important; }
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #fff; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 24px 0 8px; border-top: 1px solid #ddd; padding-top: 16px; }
+  h3 { font-size: 13px; margin: 0 0 6px; color: #555; font-weight: 600; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; padding: 8px 12px; margin: 0; min-width: 0; }
+  legend { font-weight: 600; font-size: 13px; padding: 0 4px; }
+  #controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 12px; }
+  label { display: block; margin: 4px 0; }
+  label span { float: right; font-variant-numeric: tabular-nums; }
+  label.check span { float: none; }
+  input[type=range], select { width: 100%; }
+  #status { color: #666; margin: 8px 0; min-height: 1.4em; }
+  .readouts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 12px 0; }
+  .readouts div { border-left: 3px solid #ccc; padding-left: 8px; }
+  .readouts div.good { border-color: #2a9d5c; }
+  .readouts div.bad { border-color: #c8553d; }
+  .readouts b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .readouts small { color: #777; }
+  .plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 8px; }
+  .plots > div { height: 380px; min-width: 0; }
+  .plots.tall > div { height: 500px; }
+  p.note { color: #666; max-width: 75em; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 8px 0; }
+  th, td { padding: 2px 10px; text-align: right; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th:first-child, td:first-child, td.text { text-align: left; }
+  button { font: inherit; padding: 4px 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  .row label { margin: 0; }
+  .row select { width: auto; }
+  #presets button { font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>kfpfam explorer: k-mer pre-filter policies for Pfam-A</h1>
+<p class="note">Choose how k-mers are drawn from the HMMs, how a read hit is called and how both adapt per Pfam. Recall is
+  against <code>hmmsearch</code> on the same sequence. Every number is recomputed here from seeds measured across all of Pfam, with no index built. <span id="provenance"></span></p>
+<div id="status" role="status">Loading…</div>
+
+<div class="row" id="presets"><b>Start from:</b></div>
+
+<form id="controls" onsubmit="return false">
+  <fieldset><legend>K-mers from the HMM</legend>
+    <label>Seed shape <select id="shape"></select></label>
+    <label>Selection
+      <select id="method">
+        <option value="lr">Enumerate: log-odds ≥ T</option>
+        <option value="topLR">Enumerate: top N per window, by log-odds</option>
+        <option value="topP">Enumerate: top N per window, by emission probability</option>
+        <option value="sample">Sample: n draws per window from emissions</option>
+        <option value="words">Observed: words in Pfam's seed alignment</option>
+      </select></label>
+    <label id="value-row"><i id="value-name"></i> <span id="value-out"></span><input type="range" id="value" step="0.25"></label>
+    <label id="target-row">T set by
+      <select id="target">
+        <option value="fixed">One T for all Pfams, plus adaptation below</option>
+        <option value="budget">A budget of entries per column</option>
+        <option value="coverage">Coverage of each Pfam's own emissions</option>
+      </select></label>
+    <label id="budget-row">Entries per column <span id="budget-out"></span><input type="range" id="budget" min="0" max="4" step="0.05" value="2"></label>
+    <label id="coverage-row">Coverage per window <span id="coverage-out"></span><input type="range" id="coverage" min="0.005" max="0.3" step="0.005" value="0.05"></label>
+  </fieldset>
+  <fieldset><legend>Sparsity</legend>
+    <label>By hash, keep 1 in m k-mers <span id="sparsity-out"></span><input type="range" id="sparsity" min="0" max="6" step="1" value="0"></label>
+    <label>Windows kept in each Pfam, most informative first
+      <select id="windowKeep"><option value="1">All</option><option value="0.5">Top 50%</option><option value="0.25">Top 25%</option><option value="0.1">Top 10%</option></select></label>
+    <p class="note">Hash sparsity shrinks the index and the read's lookups alike. Window sparsity spends the index where a family is conserved.</p>
+  </fieldset>
+  <fieldset><legend>Read hit policy</legend>
+    <label>A model is a candidate when
+      <select id="rule">
+        <option value="diag">Diagonal score ≥ the bar</option>
+        <option value="anchors">Anchor chain in a distance window</option>
+        <option value="either">Either the diagonal or the anchor chain</option>
+        <option value="both">Both the diagonal and the anchor chain</option>
+        <option value="seed">Any one seed hits</option>
+      </select></label>
+    <label id="bar-row">Information bar, ungapped bits <span id="bar-out"></span><input type="range" id="bar" min="18" max="50" step="0.5" value="22"></label>
+    <div id="anchor-rows">
+      <label>Anchors in the chain <select id="anchorN"><option value="2">2</option><option value="3">3</option></select></label>
+      <label>Distance window, ± diagonals <span id="anchorWindow-out"></span><input type="range" id="anchorWindow" min="0" max="6" step="1" value="3"></label>
+      <label>Chain score, summed bits <span id="anchorSum-out"></span><input type="range" id="anchorSum" min="0" max="60" step="1" value="0"></label>
+    </div>
+    <label>And within this of the read's best
+      <select id="rankBits"><option value="">No rank rule</option><option value="5">5 bits</option><option value="10">10 bits</option><option value="15">15 bits</option><option value="20">20 bits</option></select></label>
+    <label class="check"><input type="checkbox" id="clanAware"> <span>Rank rule keeps the best model's clan</span></label>
+  </fieldset>
+  <fieldset><legend>Evaluate on</legend>
+    <label>Hits to keep
+      <select id="truth"><option value="ga">hmmsearch ≥ GA</option><option value="e3">hmmsearch E ≤ 1e-3</option><option value="e10">hmmsearch E ≤ 10</option><option value="all">All, including fragments hmmsearch misses</option></select></label>
+    <label>Sequences
+      <select id="set"><option value="real">Real gut metagenome ERR10889147, 124 nt, all frames</option><option value="reads">Simulated 150 bp reads from reference genomes, all frames</option><option value="f50">MGnify fragments, 50 aa, family-balanced</option><option value="f33">MGnify fragments, 33 aa, family-balanced</option><option value="all">Both fragment sets</option></select></label>
+    <details><summary>Cost assumptions</summary>
+      <label>Lookup, ns <span id="c_lookup-out"></span><input type="range" id="c_lookup" min="5" max="200" step="5" value="20"></label>
+      <label>Seed hit, rescored, ns <span id="c_hit-out"></span><input type="range" id="c_hit" min="10" max="400" step="10" value="150"></label>
+      <label>Candidate in hmmsearch, µs <span id="c_cand-out"></span><input type="range" id="c_cand" min="1" max="200" step="1" value="20"></label>
+      <label>Bytes per index entry <span id="c_bytes-out"></span><input type="range" id="c_bytes" min="2" max="12" step="1" value="4"></label>
+    </details>
+  </fieldset>
+  <fieldset><legend>Adapt k-mer selection per Pfam</legend>
+    <div id="seed-slopes"></div>
+    <p class="note">Bits added to T per standard deviation of the trait (entries per window for top-N and sampling: halved per bit). Raising T for a trait spends less on it.</p>
+  </fieldset>
+  <fieldset><legend>Adapt the bar per Pfam</legend>
+    <div id="bar-slopes"></div>
+    <p class="note">Bits added to the bar per standard deviation. A long model has more chance diagonals, so a positive length slope is the E-value argument.</p>
+  </fieldset>
+</form>
+
+<div class="readouts" id="readouts"></div>
+<p class="note" id="caveat"></p>
+
+<h2>Trade-offs</h2>
+<div class="plots">
+  <div id="plot-bars"></div>
+  <div id="plot-sweep"></div>
+</div>
+<p class="note">Left: moving the bar with this k-mer set; baselines are measured tools on the simulated reads. Right: moving this policy's main value (T, N or n). Its budget is on the x axis.</p>
+
+<h2>By match strength</h2>
+<div class="row"><label>Bin by <select id="scheme"><option value="ga">hmmsearch score relative to the family's GA</option><option value="evalue">hmmsearch E-value (Z = 20 million)</option><option value="score">hmmsearch bit score</option></select></label></div>
+<div class="plots">
+  <div id="plot-strength"></div>
+  <div id="plot-precision"></div>
+</div>
+<div class="table-wrap"><table id="strength-table"></table></div>
+<p class="note">Recall in each bin, for the set chosen above. "Not reported" fragments are from a family where hmmsearch found nothing, so recall there is what hmmsearch itself lacks. Right: where each read's candidates fall, against the same reads reversed. A weak or unreported candidate may still be true, so precision is estimated from decoys: 1 − decoy / real, per bin, not from hmmsearch's verdict. On the real metagenome, reported hits come from all 50,000 reads hmmsearch rated and their 50,000 reversed copies; the "not reported" bin needs a scan over every model, so it comes from 300 of those reads.</p>
+
+<h2>Rejecting promiscuous k-mers (k4 T7, per-read pseudo-alignment)</h2>
+<p class="note">Most hits are noise, so dropping the k-mers that make the most hits could save time, if each true pair keeps another seed. A pair survives when any seed on a diagonal at the bar is not rejected. Measured by <code>filter search</code> on 50,000 reads of ERR10889147 and the same reads reversed, against hmmsearch. Rules from the index and background need no reads; the sample and repeat rules run at query time. Independent of the policy above.</p>
+<div class="row">
+  <label>Bar <select id="prom-bar"></select></label>
+  <label>Recall bin <select id="prom-bin"></select></label>
+</div>
+<div class="plots tall">
+  <div id="plot-prom-recall"></div>
+  <div id="plot-prom-bray"></div>
+</div>
+<p class="note">"Speed, seeding" is 1 ÷ (1 − hits removed), for the seeding stage only. Bray-Curtis compares GA hits per family with no rejection; it shows whether rejection shifts a profile, not only how much recall it costs.</p>
+<div class="table-wrap"><table id="prom-table"></table></div>
+
+<h2>Whole-sample sketch: one k-mer set per sample, no read structure</h2>
+<p class="note">Instead of aligning each read, all of a sample's k-mers go into one set, and a model is kept for <code>hmmsearch</code> or nail when the set holds a k-mer scoring at or above the bar against one of its windows. Independent of the policy above. Measured with <code>filter sketch</code> on ERR10889147; the bound lumps read-level diagonal or gapped scores per model, which no k-mer set can beat.</p>
+<div class="row">
+  <label>Depth <select id="sketch-depth"><option value="sub">50,000 reads (hmmsearch truth)</option><option value="all">All 1.07 M reads (nail truth)</option></select></label>
+  <label>Rule <select id="sketch-rule"><option value="best">Best k-mer score ≥ bar</option><option value="null">Best score less the model's score on reversed reads ≥ bar</option></select></label>
+  <label>Recall of <select id="sketch-by"><option value="recall">Models present at GA</option><option value="recall5">Models with ≥ 5 GA hits</option><option value="hits">GA hits</option></select></label>
+</div>
+<div class="readouts" id="sketch-readouts"></div>
+<div class="plots tall">
+  <div id="plot-sketch-trade"></div>
+  <div id="plot-sketch-noise"></div>
+</div>
+<p class="note">Lumping multiplies the search space: every sample residue against every column of a model, about 2<sup>30</sup> at 50,000 reads and 2<sup>34</sup> at 1 M. A chance match reaches about log₂ of that at any k, so a true hit has to beat it with one k-mer, and a family seen in few reads is no louder than a family seen in many. Longer k catches more of a hit's score; it does not lower the noise.</p>
+<div class="table-wrap"><table id="sketch-table"></table></div>
+<h3>Speed</h3>
+<div class="table-wrap"><table id="sketch-cost"></table></div>
+
+<h2>Is every Pfam served?</h2>
+<div class="row">
+  <label>Trait <select id="feature"></select></label>
+</div>
+<div class="plots">
+  <div id="plot-bins"></div>
+  <div id="plot-hist"></div>
+  <div id="plot-scatter"></div>
+  <div id="plot-spend"></div>
+</div>
+<p class="note">Bins are equal-sized groups of families sampled for this set. A falling bar on the trait is a case for a slope above, and the spend panel shows what that slope would cost. Families here have at least one hit in the sample; family recalls rest on few reads, so the tail includes sampling noise.</p>
+<h3>Worst families (at least 3 hits; click one to see it below)</h3>
+<div class="table-wrap"><table id="worst"></table></div>
+
+<h2>One family: where the anchors are</h2>
+<div class="row">
+  <label>Family <input id="family" list="family-list" size="34" placeholder="Name or accession" aria-label="Family name or accession"></label>
+  <datalist id="family-list"></datalist>
+  <button type="button" id="family-random">Random with hits</button>
+  <label>Read length, aa <select id="family-read"><option value="50">50 (150 bp)</option><option value="33">33 (100 bp)</option></select></label>
+</div>
+<div class="readouts" id="family-readouts"></div>
+<div id="plot-family" style="height:960px"></div>
+<p class="note" id="family-note"></p>
+<div class="table-wrap"><table id="family-kmers"></table></div>
+
+<h2>Choices</h2>
+<div class="row">
+  <input id="name" placeholder="Name this policy" aria-label="Policy name">
+  <button type="button" id="save">Save</button>
+  <button type="button" id="export">Download as JSON</button>
+  <button type="button" id="shapes-all">Compare all seed shapes at this policy</button>
+</div>
+<div class="table-wrap"><table id="saved"></table></div>
+<div class="table-wrap"><table id="shape-table"></table></div>
+
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-cartesian-dist-min@2.35.2/plotly-cartesian.min.js"></script>
+<script type="module" src="main.js"></script>
+</body>
+</html>
