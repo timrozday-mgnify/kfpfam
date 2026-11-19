@@ -1,0 +1,9 @@
+# The filter image needs filter/ and measure/prep.py only; data/ alone is 30 GB.
+data/
+web/
+docs/
+checks/
+recruit/
+filter/target/
+.git/
+.DS_Store
