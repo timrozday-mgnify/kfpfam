@@ -144,7 +144,7 @@ SSE4.1 and NEON on 40,000):
 
 - **`Bound`**: an upper bound on the banded gapped score, in bytes. The ±8 band is one 16-byte
   register, its 17th column merged into the 16th, one read residue per step; scores round up and gap
-  costs down, so it can't drop a pair the f32 score keeps, and the f32 score runs only on what it
+  costs down, so it should not drop a pair the f32 score keeps (it did one; see below), and the f32 score runs only on what it
   passes (16% of pairs here). Four pairs run side by side, as each one is a long dependency chain. 0.13 µs
   per pair on this laptop. It needs `FILTER_MIN_GAPPED`.
 - **`gapped_band`** opens gaps from the cell before the gap, not after: opening from a gap never beats
@@ -181,12 +181,56 @@ hit-weighted, with lane-offsets per hit (which is the kernel's work):
 | 1,600,000 | .97, 35.8 | .93, 38.6 | .87, 43.5 |
 
 At 300,000 the 32 lanes give back 30% of what the kernel gains; at 1.6 M, 8%. Memory is what it
-costs: 4.9 GB at 1.6 M on this laptop. `kfpfam_block` in the pipeline is 400,000 until
-`speed_test.sh` has timed 800,000 and 1.6 M on Codon.
+costs: 4.9 GB at 1.6 M on this laptop. On Codon it made no difference (below).
 
-**Next, if the join is still the limit:** AVX-512 VBMI's `vpermb` is a 32-entry lookup in one
-instruction, about half the µops per lane again. `speed_test.sh` prints whether the node has it.
-Nothing is written for it, as it can't be run here.
+### On Codon, and a pair lost (2026-11-23)
+
+`ac87746`, same ORFs and settings, on an EPYC 9555 (Zen 5), the two builds one after the other:
+
+| | core-s | join | gapped | survivors (in join) | peak |
+|---|---|---|---|---|---|
+| `f40154c`, AVX2 | 361 | 167 | 188 | 33 | 4.9 GB |
+| `ac87746`, AVX2 | **157** | 123 | 28 | 23 | 3.7 GB |
+| `ac87746`, SSE4.1 | 206 | 172 | 29 | 24 | 3.8 GB |
+
+2.3x, and 6.6x on the gapped stage. But it wrote 4,498,148 pairs, **one short**: `Bound` was not an
+upper bound. The band's 17th column is merged into the 16th lane, and a gap from the 17th to the 16th
+moves on one residue without scoring it, while a cell that stays in a lane adds that residue's score,
+which a conserved column can make worse than the gap. The last lane now keeps its own gapped value as
+well as passing it on. The unit test had weak penalties and few edge diagonals and missed it; with both
+it fails on `ac87746`, and the fix passes 48 M random pairs. It lets 0.02% more pairs through.
+
+### The fix, AVX-512, and block size (2026-11-23)
+
+The bound fixed, a window offset loaded once for a batch (nearly every batch is four rows against one
+group), and `score4_avx512`: AVX-512 VBMI's `vpermb` looks up the whole 32-byte column in one
+instruction. Same node, ORFs and settings; every run gave `f40154c`'s 4,498,149 pairs.
+
+| | core-s | join | gapped | survivors (in join) |
+|---|---|---|---|---|
+| `f40154c`, AVX2 | 354 | 162 | 187 | 31 |
+| AVX-512 (now the default where the CPU has it) | **125** | 92 | 28 | 21 |
+| AVX2 | 137 | 104 | 28 | 21 |
+| SSE4.1 | 194 | 162 | 28 | 22 |
+
+Two predictions were wrong:
+
+- **AVX-512 is 1.13x AVX2 on the join, not 3x.** llvm-mca assumes every load hits L1. With the
+  arithmetic this cheap the join waits on something else, most likely the profile: a batch reads 4.6 KB
+  of it, the rows of one k-mer (35-65 KB, estimated) outgrow a 48 KB L1, and a tile (2 MB) outgrows a
+  1 MB L2.
+- **Block size doesn't matter.** 1.6 M ORFs at AVX-512: 262, 270 and 262 core-s in blocks of 400,000,
+  800,000 and 1.6 M, for 3.9, 4.8 and 6.5 GB. Fuller groups save the kernel what longer survivor lists
+  then cost (47 → 64 core-s). `kfpfam_block` stays at 400,000.
+
+Next, output unchanged, not timed on Codon: **four rows now meet every group of a k-mer in turn**, where
+one group met every row, so each profile row is read from L2 once per k-mer and tile (laptop: join about
+26 → 24.5 core-s, and 52 → 31 for the whole run since `f40154c`, on 309,149 ORFs); a batch without a survivor skips
+the survivor scan. `FILTER_TILE_ROWS` makes smaller tiles at `filter tile`, for `speed_test.sh` to try.
+
+In cpu-h: the B11 arms ran `generic`, 1,053 core-s here, and Mode A cost 2,153 cpu-h, so 125 is about
+250 (both against 53,275 models; a projection). nail's 287 was against 30,134 models, so it needs
+measuring again on 39.0 before the two are compared.
 
 ## Ranked plan
 
@@ -194,9 +238,10 @@ Nothing is written for it, as it can't be run here.
 |---|---|---|---|---|
 | 1 | `score4_sse41`, fused like `score4_neon` | most of 8× on x86 | **none** | **done**: 5.2x on the join on Codon |
 | 2a | AVX2, two jobs per register | 1.13× beyond #1 on Codon | **none** | **done**, replaced by 2b |
-| 2b | 32 lanes, one job per AVX2 register | 1.3–1.9× beyond #2a (predicted) | **none** | **done**, verified; time on Codon, with larger blocks |
-| 2c | SIMD bound before the gapped score | 6× on that stage under Rosetta | **none** | **done**, verified; time on Codon |
-| 2d | AVX-512 VBMI | ~2× on the join | **none** | if Codon's nodes have it |
+| 2b | 32 lanes, one job per AVX2 register | 1.3–1.9× beyond #2a (predicted) | **none** | **done**: join 167 → 123 core-s on Codon at 400,000 per block |
+| 2c | SIMD bound before the gapped score | 6.6× on that stage on Codon | **none** | **done** |
+| 2d | AVX-512 VBMI | 1.13× on the join on Codon | **none** | **done** |
+| 2e | Four rows against every group; smaller tiles | unknown: the join waits on memory | **none** | loop done, tiles optional; time on Codon |
 | 3 | GA-only settings for RawR: bar 22, min_gapped ~24, not bar 17 | 1.5× | .999 → .995 ≥GA | config only |
 | 4 | T7.5 for RawR instead of T6.5 | 2.3× | .995 → .984 ≥GA | config only |
 | 5 | Per-model T as a length rule | 1.2× | none at equal hits | implemented (`FILTER_T_FILE`), needs the rule |
@@ -225,7 +270,8 @@ that their k-mers were all promiscuous and dropped is **ruled out**, twice over:
 They are also unremarkable as models — median length 142 aa against 120 for the rest, median GA
 27.0 against 27.0, mean information 0.69 against 0.73 — and locally **Mode A emits candidates for
 all 183**, and for 30,131 of 30,134 models overall. So the loss is in the prep or index built on
-Codon by `hpc/pfam-arms/kfpfam_setup.sh`, not in the method. See
+Codon by `hpc/pfam-arms/kfpfam_setup.sh`, not in the method: confirmed 2026-11-23, they came from another
+Pfam release, with 53,275 models. See
 [benchmark representativeness](benchmark-representativeness.md) for the diagnostic.
 
 The only genuine blind spot here is three models too short to carry a 4-mer above any bar:

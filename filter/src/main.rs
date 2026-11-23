@@ -419,7 +419,10 @@ unsafe fn bound<V: Bytes16>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
             };
             debug_assert!(at + 17 <= prof.len());
             let s = V::load(prof.as_ptr().add(at)).max(V::load(prof.as_ptr().add(at + 1)).min(last));
-            del[p] = h[p].ext::<1>(neg).subs(open).max(del[p].ext::<1>(neg).subs(e1));
+            // up one lane, except that the last keeps its own value too: it stands for two columns, and a
+            // gap from the second to the first stays in it
+            let up = h[p].subs(open).max(del[p].subs(e1));
+            del[p] = up.ext::<1>(up.ext::<15>(neg));
             let m = h[p].adds(s).max(del[p]);
             let mut x = neg.ext::<15>(m.subs(open));
             x = x.max(neg.ext::<15>(x).subs(e1));
@@ -782,12 +785,14 @@ fn tile_bases(pf: &Pfam, m0: usize, m1: usize) -> Vec<usize> {
 }
 
 fn tile(pf: &Pfam, idx: &Index, out: &str) {
+    // FILTER_TILE_ROWS=n: smaller tiles than TILE_ROWS, for an L2 under 2 MB
+    let tile_rows = std::env::var("FILTER_TILE_ROWS").map_or(TILE_ROWS, |v| v.parse().unwrap()).min(TILE_ROWS);
     let mut bounds = vec![0usize];
     let mut rows_in = 0usize;
     for m in 0..pf.models() {
         let rows_m = (pf.offs[m + 1] - pf.offs[m]) as usize + WIN;
         assert!(rows_m <= TILE_ROWS);
-        if rows_in + rows_m > TILE_ROWS {
+        if rows_in > 0 && rows_in + rows_m > tile_rows {
             bounds.push(m);
             rows_in = 0;
         }
@@ -957,8 +962,15 @@ fn postings(orfs: &[&[u8]], k: usize) -> Postings {
 ///
 /// In SIMD a score is held less 128, so the saturating add is also the local score's floor. That lets it
 /// run past 127, where the scalar one sticks, but only once it has passed every gate.
+///
+/// Nearly every batch is four rows against one group, so each SIMD kernel has a version (ONE) that loads
+/// a window offset once for all four jobs.
 type Masks = [(u64, u64); 4];
 type Scorer4 = fn(&[i8], [usize; 4], [&[u8]; 4], (usize, usize), (i8, i8), &mut Masks);
+
+fn one_group(w: &[&[u8]; 4]) -> bool {
+    w.iter().all(|x| std::ptr::eq(x.as_ptr(), w[0].as_ptr()))
+}
 
 /// The oracle: every SIMD version must return the same.
 fn score4_scalar(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
@@ -978,6 +990,16 @@ fn score4_scalar(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usi
 
 #[cfg(target_arch = "aarch64")]
 fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    if one_group(&w) {
+        score4_neon_inner::<true>(prof, rows, w, span, gates, masks)
+    } else {
+        score4_neon_inner::<false>(prof, rows, w, span, gates, masks)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn score4_neon_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::aarch64::*;
     for i in 0..4 {
         assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
@@ -986,9 +1008,12 @@ fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize
         let (mut cur, mut best) = ([vdupq_n_s8(i8::MIN); 4], [vdupq_n_s8(i8::MIN); 4]);
         let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
         for o in span.0..span.1 {
+            let mut idx = vld1q_u8(w[0].as_ptr().add(o * LANES));
             for i in 0..4 {
                 let table = vld1q_s8_x2(p[i].add(o * STRIDE));
-                let idx = vld1q_u8(w[i].as_ptr().add(o * LANES));
+                if !ONE {
+                    idx = vld1q_u8(w[i].as_ptr().add(o * LANES));
+                }
                 cur[i] = vqaddq_s8(cur[i], vqtbl2q_s8(table, idx));
                 best[i] = vmaxq_s8(best[i], cur[i]);
             }
@@ -1006,7 +1031,7 @@ fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize
 /// `vqtbl2q_s8` is one instruction. Here 32 lanes are two passes of 16.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
-unsafe fn score4_sse41_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+unsafe fn score4_sse41_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::x86_64::*;
     for i in 0..4 {
         assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
@@ -1018,11 +1043,16 @@ unsafe fn score4_sse41_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span:
     for half in 0..2 {
         let (mut cur, mut best) = ([flip; 4], [flip; 4]);
         for o in span.0..span.1 {
+            let mut idx = _mm_loadu_si128(w[0].as_ptr().add(o * LANES + half * 16) as *const __m128i);
+            let mut idx_hi = _mm_xor_si128(idx, flip);
             for i in 0..4 {
                 let col = p[i].add(o * STRIDE) as *const __m128i;
-                let idx = _mm_loadu_si128(w[i].as_ptr().add(o * LANES + half * 16) as *const __m128i);
+                if !ONE {
+                    idx = _mm_loadu_si128(w[i].as_ptr().add(o * LANES + half * 16) as *const __m128i);
+                    idx_hi = _mm_xor_si128(idx, flip);
+                }
                 let lo = _mm_shuffle_epi8(_mm_loadu_si128(col), idx);
-                let hi = _mm_shuffle_epi8(_mm_loadu_si128(col.add(1)), _mm_xor_si128(idx, flip));
+                let hi = _mm_shuffle_epi8(_mm_loadu_si128(col.add(1)), idx_hi);
                 cur[i] = _mm_adds_epi8(cur[i], _mm_or_si128(lo, hi));
                 best[i] = _mm_max_epi8(best[i], cur[i]);
             }
@@ -1038,14 +1068,18 @@ unsafe fn score4_sse41_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span:
 
 #[cfg(target_arch = "x86_64")]
 fn score4_sse41(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
-    unsafe { score4_sse41_inner(prof, rows, w, span, gates, masks) }
+    if one_group(&w) {
+        unsafe { score4_sse41_inner::<true>(prof, rows, w, span, gates, masks) }
+    } else {
+        unsafe { score4_sse41_inner::<false>(prof, rows, w, span, gates, masks) }
+    }
 }
 
 /// AVX2: one job's 32 lanes per register. `vpshufb` shuffles each 128-bit half with its own table, so both
 /// halves get the same one, broadcast from memory, which costs a load and no shuffle.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn score4_avx2_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+unsafe fn score4_avx2_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::x86_64::*;
     for i in 0..4 {
         assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
@@ -1054,11 +1088,16 @@ unsafe fn score4_avx2_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: 
     let flip = _mm256_set1_epi8(i8::MIN);
     let (mut cur, mut best) = ([flip; 4], [flip; 4]);
     for o in span.0..span.1 {
+        let mut idx = _mm256_loadu_si256(w[0].as_ptr().add(o * LANES) as *const __m256i);
+        let mut idx_hi = _mm256_xor_si256(idx, flip);
         for i in 0..4 {
             let col = p[i].add(o * STRIDE) as *const __m128i;
-            let idx = _mm256_loadu_si256(w[i].as_ptr().add(o * LANES) as *const __m256i);
+            if !ONE {
+                idx = _mm256_loadu_si256(w[i].as_ptr().add(o * LANES) as *const __m256i);
+                idx_hi = _mm256_xor_si256(idx, flip);
+            }
             let lo = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(col)), idx);
-            let hi = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(col.add(1))), _mm256_xor_si256(idx, flip));
+            let hi = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(col.add(1))), idx_hi);
             cur[i] = _mm256_adds_epi8(cur[i], _mm256_or_si256(lo, hi));
             best[i] = _mm256_max_epi8(best[i], cur[i]);
         }
@@ -1072,7 +1111,50 @@ unsafe fn score4_avx2_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: 
 
 #[cfg(target_arch = "x86_64")]
 fn score4_avx2(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
-    unsafe { score4_avx2_inner(prof, rows, w, span, gates, masks) }
+    if one_group(&w) {
+        unsafe { score4_avx2_inner::<true>(prof, rows, w, span, gates, masks) }
+    } else {
+        unsafe { score4_avx2_inner::<false>(prof, rows, w, span, gates, masks) }
+    }
+}
+
+/// AVX-512 VBMI: `vpermb` is a lookup in the whole 32-byte column, its table straight from memory. It uses
+/// an index's low 5 bits, so the BIAS of 0x70 (16 modulo 32) is taken off with one bit. Four instructions a
+/// job with AVX2's lanes: under half as many.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn score4_avx512_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    use std::arch::x86_64::*;
+    for i in 0..4 {
+        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+    }
+    let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
+    let (zero, unbias) = (_mm256_set1_epi8(i8::MIN), _mm256_set1_epi8(16));
+    let (mut cur, mut best) = ([zero; 4], [zero; 4]);
+    for o in span.0..span.1 {
+        let mut idx = _mm256_xor_si256(_mm256_loadu_si256(w[0].as_ptr().add(o * LANES) as *const __m256i), unbias);
+        for i in 0..4 {
+            if !ONE {
+                idx = _mm256_xor_si256(_mm256_loadu_si256(w[i].as_ptr().add(o * LANES) as *const __m256i), unbias);
+            }
+            let s = _mm256_permutexvar_epi8(idx, _mm256_loadu_si256(p[i].add(o * STRIDE) as *const __m256i));
+            cur[i] = _mm256_adds_epi8(cur[i], s);
+            best[i] = _mm256_max_epi8(best[i], cur[i]);
+        }
+    }
+    let (g0, g1) = (_mm256_set1_epi8(gates.0 ^ i8::MIN), _mm256_set1_epi8(gates.1 ^ i8::MIN));
+    for i in 0..4 {
+        masks[i] = (_mm256_cmpge_epi8_mask(best[i], g0) as u64, _mm256_cmpge_epi8_mask(best[i], g1) as u64);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn score4_avx512(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    if one_group(&w) {
+        unsafe { score4_avx512_inner::<true>(prof, rows, w, span, gates, masks) }
+    } else {
+        unsafe { score4_avx512_inner::<false>(prof, rows, w, span, gates, masks) }
+    }
 }
 
 /// Every kernel this CPU has, fastest first. FILTER_SIMD=name forces one.
@@ -1082,6 +1164,9 @@ fn scorers() -> Vec<(&'static str, Scorer4)> {
     all.push(("neon", score4_neon));
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512vbmi") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx512bw") {
+            all.push(("avx512", score4_avx512));
+        }
         if is_x86_feature_detected!("avx2") {
             all.push(("avx2", score4_avx2));
         }
@@ -1239,11 +1324,24 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         continue;
                     }
                     n_hits += (r1 - r0) as u64 * p.count[code] as u64;
-                    // the list is read from memory once here, then stays in cache for every row;
-                    // one group against four rows at a time, so a batch shares the group's span
-                    for g in g0..g1 {
-                        // offset 0 of the window sits at column c - HALF, padded row c
-                        for &row in &tile.rows[r0..r1] {
+                    // Four rows against every group in turn: their 48 columns (6 KB) and the k-mer's windows stay
+                    // in L1, where one group against every row would read a longer run of profile again per
+                    // group. Rows left over wait for company, whatever its k-mer.
+                    let rows = &tile.rows[r0..r1];
+                    let whole = rows.len() / 4 * 4;
+                    for four in rows[..whole].chunks_exact(4) {
+                        let four = [four[0] as usize, four[1] as usize, four[2] as usize, four[3] as usize];
+                        for g in g0..g1 {
+                            let w = &p.windows[g * WIN * LANES..(g + 1) * WIN * LANES];
+                            score4(prof, four, [w; 4], (p.span[g].0 as usize, p.span[g].1 as usize), (gate, covered_gate), &mut masks);
+                            // two batches in three have no survivor
+                            if masks.iter().fold(0, |any, m| any | m.0) != 0 {
+                                drain(&four.map(|row| (row, g)), &masks, surv);
+                            }
+                        }
+                    }
+                    for &row in &rows[whole..] {
+                        for g in g0..g1 {
                             jobs[queued] = (row as usize, g);
                             queued += 1;
                             span = (span.0.min(p.span[g].0 as usize), span.1.max(p.span[g].1 as usize));
@@ -1387,9 +1485,10 @@ mod tests {
         for t in 0..400 {
             // residues and padding, or only well-scoring ones
             let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..WIN * LANES).map(|_| (next() % 21) as u8 + BIAS).collect()).collect();
-            let w = [&ws[0][..], &ws[1][..], &ws[2][..], &ws[3][..]];
+            // four groups, or one for all four jobs
+            let w = [0, 1, 2, 3].map(|i| &ws[if t % 2 == 0 { i } else { 0 }][..]);
             let rows = [0, 1, 2, 3].map(|_| (next() % (2 * WIN as u64)) as usize);
-            let (span, gates) = (((next() % 10) as usize, WIN - (next() % 10) as usize), ([66, 10, 127, 0][t % 4], [68, 127, 100, 40][t % 4]));
+            let (span, gates) = (((next() % 10) as usize, WIN - (next() % 10) as usize), ([66, 10, 127, 0][t / 2 % 4], [68, 127, 100, 40][t / 2 % 4]));
             let mut want: Masks = [(0, 0); 4];
             score4_scalar(&prof, rows, w, span, gates, &mut want);
             for (name, kernel) in scorers() {
@@ -1412,7 +1511,7 @@ mod tests {
         for n in lens {
             let t: Vec<u8> = (0..n).map(|_| (next() % 20) as u8).collect();
             for &best in &t {
-                lo.extend((0..21u8).map(|r| if r == best { 2.0 + (next() % 200) as f32 / 100.0 } else { -(next() as u32 as f32 / u32::MAX as f32) * 3.0 }));
+                lo.extend((0..21u8).map(|r| if r == best { 2.0 + (next() % 200) as f32 / 100.0 } else { -(next() as u32 as f32 / u32::MAX as f32) * 12.0 }));
             }
             offs.push(offs.last().unwrap() + n as u32);
             top.push(t);
@@ -1427,11 +1526,16 @@ mod tests {
                 for _ in 0..PAIRS {
                     let m = (next() % 3) as usize;
                     let (mut f, mut c) = (vec![], (next() % lens[m] as u64) as usize);
-                    let d = c as i64 - (next() % 5) as i64 + (next() % 21) as i64 - 10;
+                    let d = c as i64 + [0, -8, 8, -7, 7, 9][(next() % 6) as usize] + (next() % 3) as i64 - 1;
                     while f.len() < 1 + (next() % 60) as usize {
                         match next() % 12 {
                             0 => c += (next() % 4) as usize,
-                            1..=3 => f.push((next() % 21) as u8),
+                            // residues of the read in a gap
+                            1 => {
+                                f.extend((0..=next() % 3).map(|_| (next() % 21) as u8));
+                                continue;
+                            }
+                            2 => f.push((next() % 21) as u8),
                             _ => f.push(top[m].get(c).copied().unwrap_or(20)),
                         }
                         c += 1;
