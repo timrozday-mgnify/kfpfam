@@ -113,27 +113,97 @@ Under emulation the fused kernels ran at 13–15 ns per hit against generic's 39
 direction, not magnitude: emulation translates x86 into ARM, and in particular says nothing about
 AVX2 against SSE4.1 (they came out level). **The speed-up has to be measured on Codon.**
 
-`FILTER_SIMD=sse4.1` forces the narrower kernel on an AVX2 machine and `FILTER_SIMD=generic` the
-old path, so one binary measures all three:
+`FILTER_SIMD=sse4.1` forces the narrower kernel on an AVX2 machine. `FILTER_SIMD=generic`, the
+path before these kernels, was removed once Codon had measured it (below); `f40154c` still has it.
 
-```bash
-for m in "" sse4.1 generic; do FILTER_SIMD=$m measure/speed.sh x86_${m:-avx2} 16 join data/index/k4T6.5.tidx 22 16.5 400000; done
-```
+## Codon, and what it left (2026-11-23)
+
+`speed_test.sh` in `nar-review-response/hpc/B11_pfam_arms`: 800,000 ORFs (25.4 M residues) of
+SRR23926920, Mode A (T6.5, bar 17, gate 16.5, gapped 21.25), 8 threads, 400,000 ORFs per block.
+All three kernels wrote the same 4,498,149 pairs.
+
+| kernel at `f40154c` | core-s | join | gapped | core-µs per residue |
+|---|---|---|---|---|
+| AVX2 | 347 | 165 | 177 | 13.7 |
+| SSE4.1 | 374 | 186 | 183 | 14.7 |
+| generic (what every B11 arm ran on) | 1,053 | 857 | 191 | 41 |
+
+The fused kernels are worth 3.0x overall, 5.2x on the join. `generic`'s 41 agrees with the 46
+estimated from the B11 trace, so Mode A's 2,153 cpu-h would be about 710: still 2.5x nail's 287.
+Three things stood out:
+
+- **The gapped stage was the largest**, 2.5 µs for each of 71.7 M pairs, of which 6% were written.
+  Its loop was one scalar dependency chain per row.
+- **AVX2 was 1.13x SSE4.1 on the join**, as half its instructions put two jobs into one register.
+- **The kernel, not memory, limits the join.** llvm-mca gives 0.125 cycles per lane-offset on
+  Cascade Lake; at about 43 lane-offsets per hit that is 1.8 ns at 3 GHz, and 1.5 was measured once
+  the survivor stage is taken off.
+
+What changed, with the same pairs out, byte for byte, as `f40154c` (NEON on 309,149 ORFs; AVX2,
+SSE4.1 and NEON on 40,000):
+
+- **`Bound`**: an upper bound on the banded gapped score, in bytes. The ±8 band is one 16-byte
+  register, its 17th column merged into the 16th, one read residue per step; scores round up and gap
+  costs down, so it can't drop a pair the f32 score keeps, and the f32 score runs only on what it
+  passes (16% of pairs here). Four pairs run side by side, as each one is a long dependency chain. 0.13 µs
+  per pair on this laptop. It needs `FILTER_MIN_GAPPED`.
+- **`gapped_band`** opens gaps from the cell before the gap, not after: opening from a gap never beats
+  extending it, so the score is the same and the chain is half as long.
+- **Survivors** are one `u64` each, so they sort as integers.
+- **The gapped stage runs inside each tile**, so a block no longer holds its pairs.
+- **x86 has 32 lanes, one job per register.** A profile column's halves are broadcast from memory,
+  which costs a load and no shuffle; windows are stored plus 0x70, so `pshufb`'s zero for an index with
+  its top bit set replaces the compare and blend; scores are held less 128, so the saturating add is
+  also the floor. The last of these is on NEON too.
+
+llvm-mca, cycles per lane-offset (predicted, not timed):
+
+| | Cascade Lake | Ice Lake | Zen 2 | Zen 3 |
+|---|---|---|---|---|
+| AVX2 before | .125 | .116 | .146 | .126 |
+| AVX2 now | .067 | .067 | .110 | .073 |
+| SSE4.1 before | .188 | .168 | .169 | .113 |
+| SSE4.1 now | .134 | .134 | .181 | .121 |
+
+On this laptop, 3.2 M ORFs, 8 threads, 400,000 per block: **516 → 378 core-s**, gapped 152 → 59,
+survivors 52 → 32, join 345 → 297 with survivors in it, peak 4.0 → 3.3 GB. The gapped figures are not
+quite alike: before, the stage was charged for idle threads, and now it is not. Under Rosetta
+the gapped stage goes 5.4 → 0.9 core-s on 40,000 ORFs. Rosetta runs the new AVX2 kernel at half
+the SSE4.1 one's speed, so nothing about AVX2 can be read from it.
+
+**Block size now matters.** A group is full only if its k-mer has enough postings in the block:
+hit-weighted, with lane-offsets per hit (which is the kernel's work):
+
+| ORFs per block | 16 lanes | 32 lanes | 64 lanes |
+|---|---|---|---|
+| 300,000 | .83, 45.7 | .69, 59.5 | .48, 90.6 |
+| 800,000 | .93, 38.3 | .87, 43.3 | .75, 53.6 |
+| 1,600,000 | .97, 35.8 | .93, 38.6 | .87, 43.5 |
+
+At 300,000 the 32 lanes give back 30% of what the kernel gains; at 1.6 M, 8%. Memory is what it
+costs: 4.9 GB at 1.6 M on this laptop. `kfpfam_block` in the pipeline is 400,000 until
+`speed_test.sh` has timed 800,000 and 1.6 M on Codon.
+
+**Next, if the join is still the limit:** AVX-512 VBMI's `vpermb` is a 32-entry lookup in one
+instruction, about half the µops per lane again. `speed_test.sh` prints whether the node has it.
+Nothing is written for it, as it can't be run here.
 
 ## Ranked plan
 
 | # | Change | Expected | Recall cost | Effort |
 |---|---|---|---|---|
-| 1 | `score4_sse41`, fused like `score4_neon` | most of 8× on x86 | **none** | **done**, verified; measure on Codon |
-| 2a | AVX2, two jobs per register | ~1.5× beyond #1 | **none** | **done**, verified; measure on Codon |
-| 2b | 32 / 64 lanes (AVX2, AVX-512 VBMI) | up to 2–4× beyond #2a | **none** | widens `LANES` in `postings`; only if #1–2a leave the kernel as the limit |
+| 1 | `score4_sse41`, fused like `score4_neon` | most of 8× on x86 | **none** | **done**: 5.2x on the join on Codon |
+| 2a | AVX2, two jobs per register | 1.13× beyond #1 on Codon | **none** | **done**, replaced by 2b |
+| 2b | 32 lanes, one job per AVX2 register | 1.3–1.9× beyond #2a (predicted) | **none** | **done**, verified; time on Codon, with larger blocks |
+| 2c | SIMD bound before the gapped score | 6× on that stage under Rosetta | **none** | **done**, verified; time on Codon |
+| 2d | AVX-512 VBMI | ~2× on the join | **none** | if Codon's nodes have it |
 | 3 | GA-only settings for RawR: bar 22, min_gapped ~24, not bar 17 | 1.5× | .999 → .995 ≥GA | config only |
 | 4 | T7.5 for RawR instead of T6.5 | 2.3× | .995 → .984 ≥GA | config only |
 | 5 | Per-model T as a length rule | 1.2× | none at equal hits | implemented (`FILTER_T_FILE`), needs the rule |
 | 6 | Drop promiscuous k-mers | 1.5× | ~.001 | implemented (`FILTER_DROP`), needs a default |
 
-**#1 + #3 is the 10×**, and only #3 touches recall. Measure #1 on Codon with `measure/speed.sh`
-before and after; the x86 figure, not this laptop's, is the one that matters.
+#1 to #2c cost no recall, so #3 and #4 wait on what they measure on Codon. The x86 figure, not this
+laptop's, is the one that matters.
 
 Two things *not* worth pursuing on the evidence: more threads (Codon already ran at 95.7%
 efficiency on 16 cores, against nail's 50.7%), and narrowing the 48-residue window — the `span`

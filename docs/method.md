@@ -167,7 +167,7 @@ Each was measured on the same truth; the plan's Progress log has the numbers and
 | One `hmmsearch` call per model in pyhmmer | 5.7 core-ms per read, thread start-up | One `Pipeline` per worker thread: 0.25–0.56; fork workers instead: 2.7× less (threads lose most of their time to the interpreter lock) |
 | Gathering cut-offs for speed | Same cost as E ≤ 1000 | No gain; used only for output |
 | HMMs as text | 224 s to load | Binary file, 1 s |
-| AVX2 | Not written | No x86 toolchain on the laptop; the SSE4.1 path is written but not yet built |
+| AVX2 | Two jobs per register: 1.13× SSE4.1 on the join on Codon | Superseded by 32 lanes, one job per register ([scaling](scaling.md)) |
 
 ## After HMMER: recruiting weak reads
 
@@ -179,7 +179,7 @@ loci to 172,619 at GA, with an estimated per-read FDR of 2%. On a simulated samp
 
 ## Limits
 
-- One sample, one machine. Other biomes, x86 (SSE4.1 untested, AVX2 not written) and the full
+- One sample, one machine. Other biomes and the full
   read set's truth are step 7 of the plan: a Nextflow benchmark for the HPC.
 - Truth is `hmmsearch` on the same ORFs. Reads where `hmmsearch` itself misses a domain don't count.
 - Recall is per (ORF, model) pair; weak bins include noise (see reversed-read precision above).

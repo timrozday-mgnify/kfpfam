@@ -189,6 +189,12 @@ impl Packed {
     }
 }
 
+/// max without f32::max's NaN rule, which costs baseline x86 three instructions where maxss is one.
+#[inline(always)]
+fn fmax(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+
 /// Best local alignment with affine gaps, in bits. Whole matrix and scalar: about 16 core-us per pair.
 fn gapped(lo: &[f32], a: usize, cols: usize, f: &[u8], h: &mut Vec<f32>, del: &mut Vec<f32>) -> f32 {
     h.clear();
@@ -233,22 +239,198 @@ fn gapped_band(lo: &[f32], a: usize, cols: usize, f: &[u8], d: i64, band: i64, h
         if (c_hi as i64) > (i as i64 - 1) + d + band + 1 || i == 0 {
             del[c_hi] = f32::NEG_INFINITY;
         }
-        let (mut diag, mut left, mut ins) = (h[c_lo - 1], 0.0f32, f32::NEG_INFINITY);
+        let mut diag = h[c_lo - 1];
         if c_lo as i64 - 1 < (i as i64 - 1) + d - band + 1 {
             diag = 0.0; // left of last row's band
         }
-        for c in c_lo..=c_hi {
+        // a gap opens from m, the cell before `ins`: opening from a gap never beats extending it, and the
+        // row's dependency chain is then ins alone
+        let (mut m, mut ins) = (0.0f32, f32::NEG_INFINITY);
+        let n = c_hi - c_lo + 1;
+        let (h, del, lo) = (&mut h[c_lo..][..n], &mut del[c_lo..][..n], &lo[(a + c_lo - 1) * 21..][..n * 21]);
+        for c in 0..n {
             let up = h[c];
-            del[c] = (up - GAP_OPEN).max(del[c] - GAP_EXTEND);
-            ins = (left - GAP_OPEN).max(ins - GAP_EXTEND);
-            let v = (diag + lo[(a + c - 1) * 21 + r as usize]).max(del[c]).max(ins).max(0.0);
+            let dl = fmax(up - GAP_OPEN, del[c] - GAP_EXTEND);
+            del[c] = dl;
+            ins = fmax(m - GAP_OPEN, ins - GAP_EXTEND);
+            m = fmax(fmax(diag + lo[c * 21 + r as usize], dl), 0.0);
             diag = up;
+            let v = fmax(m, ins);
             h[c] = v;
-            left = v;
-            best = best.max(v);
+            best = fmax(best, v);
         }
     }
     best
+}
+
+/// What the gapped bound needs of a SIMD register: 16 signed bytes.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+trait Bytes16: Copy {
+    unsafe fn load(p: *const i8) -> Self;
+    unsafe fn splat(v: i8) -> Self;
+    unsafe fn adds(self, o: Self) -> Self;
+    unsafe fn subs(self, o: Self) -> Self;
+    unsafe fn max(self, o: Self) -> Self;
+    unsafe fn min(self, o: Self) -> Self;
+    /// Bytes N..N + 16 of self followed by o.
+    unsafe fn ext<const N: i32>(self, o: Self) -> Self;
+    unsafe fn hmax(self) -> i8;
+}
+#[cfg(target_arch = "aarch64")]
+impl Bytes16 for std::arch::aarch64::int8x16_t {
+    #[inline(always)]
+    unsafe fn load(p: *const i8) -> Self { std::arch::aarch64::vld1q_s8(p) }
+    #[inline(always)]
+    unsafe fn splat(v: i8) -> Self { std::arch::aarch64::vdupq_n_s8(v) }
+    #[inline(always)]
+    unsafe fn adds(self, o: Self) -> Self { std::arch::aarch64::vqaddq_s8(self, o) }
+    #[inline(always)]
+    unsafe fn subs(self, o: Self) -> Self { std::arch::aarch64::vqsubq_s8(self, o) }
+    #[inline(always)]
+    unsafe fn max(self, o: Self) -> Self { std::arch::aarch64::vmaxq_s8(self, o) }
+    #[inline(always)]
+    unsafe fn min(self, o: Self) -> Self { std::arch::aarch64::vminq_s8(self, o) }
+    #[inline(always)]
+    unsafe fn ext<const N: i32>(self, o: Self) -> Self { std::arch::aarch64::vextq_s8::<N>(self, o) }
+    #[inline(always)]
+    unsafe fn hmax(self) -> i8 { std::arch::aarch64::vmaxvq_s8(self) }
+}
+#[cfg(target_arch = "x86_64")]
+impl Bytes16 for std::arch::x86_64::__m128i {
+    #[inline(always)]
+    unsafe fn load(p: *const i8) -> Self { std::arch::x86_64::_mm_loadu_si128(p as *const _) }
+    #[inline(always)]
+    unsafe fn splat(v: i8) -> Self { std::arch::x86_64::_mm_set1_epi8(v) }
+    #[inline(always)]
+    unsafe fn adds(self, o: Self) -> Self { std::arch::x86_64::_mm_adds_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn subs(self, o: Self) -> Self { std::arch::x86_64::_mm_subs_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn max(self, o: Self) -> Self { std::arch::x86_64::_mm_max_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn min(self, o: Self) -> Self { std::arch::x86_64::_mm_min_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn ext<const N: i32>(self, o: Self) -> Self { std::arch::x86_64::_mm_alignr_epi8::<N>(o, self) }
+    #[inline(always)]
+    unsafe fn hmax(self) -> i8 {
+        let mut b = [0i8; 16];
+        std::arch::x86_64::_mm_storeu_si128(b.as_mut_ptr() as *mut _, self);
+        b.into_iter().max().unwrap()
+    }
+}
+
+/// An upper bound on gapped_band's score, in bytes, one read residue per step with the band in one
+/// register, so a pair that cannot reach `min` is dropped without the f32 matrix. Scores are rounded up,
+/// gap costs down and the band's 17th column is merged into the 16th, so it never drops a pair
+/// gapped_band would keep.
+struct Bound {
+    prof: Vec<i8>, // per model, 21 residues x (PAD + columns + PAD), residue-major
+    at: Vec<usize>,
+    scale: f32,
+    pass: i8, // the lowest bound that may reach min, offset by -128
+}
+const PAD: usize = 24; // columns either side of a model: the band may hang off both ends
+const BAND: i64 = 8;
+impl Bound {
+    /// None when there is nothing to bound (no min), or no SIMD for it here.
+    fn new(pf: &Pfam, min: f32) -> Option<Bound> {
+        if !(16.0..=250.0).contains(&min) || std::env::var("FILTER_SIMD").as_deref() == Ok("scalar") {
+            return None;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
+            return None;
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        return None;
+        let scale = (254.0 / min).floor(); // at most 15 here, so 8 gap extensions fit in a byte
+        let mut at = vec![0usize];
+        for m in 0..pf.models() {
+            at.push(at[m] + 21 * ((pf.offs[m + 1] - pf.offs[m]) as usize + 2 * PAD));
+        }
+        let mut prof = vec![i8::MIN; *at.last().unwrap()];
+        let mut parts = Vec::with_capacity(pf.models());
+        let mut rest: &mut [i8] = &mut prof;
+        for m in 0..pf.models() {
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(at[m + 1] - at[m]);
+            parts.push(head);
+            rest = tail;
+        }
+        parts.into_par_iter().enumerate().for_each(|(m, out)| {
+            let (a, stride) = (pf.offs[m] as usize, out.len() / 21);
+            for c in 0..stride - 2 * PAD {
+                for r in 0..21 {
+                    out[r * stride + PAD + c] = (pf.lo[(a + c) * 21 + r] * scale).ceil().clamp(-128.0, 127.0) as i8;
+                }
+            }
+        });
+        Some(Bound { prof, at, scale, pass: ((min * scale - 0.01).floor() - 128.0) as i8 })
+    }
+    /// Whether each pair (model, read, diagonal as column - read position) may reach min.
+    fn may_reach(&self, pairs: [(usize, &[u8], i64); PAIRS]) -> [bool; PAIRS] {
+        let jobs = pairs.map(|(m, f, d)| (&self.prof[self.at[m]..self.at[m + 1]], f, d));
+        #[cfg(target_arch = "aarch64")]
+        return unsafe { bound::<std::arch::aarch64::int8x16_t>(jobs, self.scale) }.map(|b| b >= self.pass);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // AVX2 for its three-operand encoding; the registers are 16 bytes either way
+            #[target_feature(enable = "avx2")]
+            unsafe fn run(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
+                bound::<std::arch::x86_64::__m128i>(jobs, scale)
+            }
+            return unsafe { run(jobs, self.scale) }.map(|b| b >= self.pass);
+        }
+        #[allow(unreachable_code)]
+        [true; PAIRS]
+    }
+}
+const PAIRS: usize = 4; // scored side by side, as each pair's rows are one long dependency chain
+type Job<'a> = (&'a [i8], &'a [u8], i64); // a model's rows of Bound::prof, read, diagonal
+
+/// The band as lanes: lane l is column i + d - 8 + l at read position i, so last row's cell on the same
+/// diagonal is the same lane and the cell above is the next lane. Zero is -128, so saturation is the local
+/// score's floor. Gaps along the model are a prefix maximum, taken in doubling steps.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn bound<V: Bytes16>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
+    let neg = V::splat(i8::MIN);
+    let ext = (GAP_EXTEND * scale) as i8;
+    let open = V::splat((GAP_OPEN * scale) as i8);
+    let (e1, e2, e4, e8) = (V::splat(ext), V::splat(2 * ext), V::splat(4 * ext), V::splat(8 * ext));
+    let mut last = [i8::MIN; 16];
+    last[15] = i8::MAX;
+    let last = V::load(last.as_ptr());
+    let (mut h, mut del, mut best) = ([neg; PAIRS], [neg; PAIRS], [neg; PAIRS]);
+    // each pair runs from the first read position whose band touches its model to the last
+    let rows = jobs.map(|(prof, f, d)| {
+        let cols = (prof.len() / 21 - 2 * PAD) as i64;
+        ((-d - BAND).max(0), (f.len() as i64).min(cols - d + BAND))
+    });
+    let steps = rows.iter().map(|&(from, to)| to - from).max().unwrap().max(0);
+    for step in 0..steps {
+        for p in 0..PAIRS {
+            let (prof, f, d) = jobs[p];
+            let i = rows[p].0 + step;
+            // a pair that is done reads padding, the first bytes of its profile
+            let at = if i < rows[p].1 {
+                *f.get_unchecked(i as usize) as usize * (prof.len() / 21) + (PAD as i64 + i + d - BAND) as usize
+            } else {
+                0
+            };
+            debug_assert!(at + 17 <= prof.len());
+            let s = V::load(prof.as_ptr().add(at)).max(V::load(prof.as_ptr().add(at + 1)).min(last));
+            del[p] = h[p].ext::<1>(neg).subs(open).max(del[p].ext::<1>(neg).subs(e1));
+            let m = h[p].adds(s).max(del[p]);
+            let mut x = neg.ext::<15>(m.subs(open));
+            x = x.max(neg.ext::<15>(x).subs(e1));
+            x = x.max(neg.ext::<14>(x).subs(e2));
+            x = x.max(neg.ext::<12>(x).subs(e4));
+            x = x.max(neg.ext::<8>(x).subs(e8));
+            h[p] = m.max(x);
+            best[p] = best[p].max(h[p]);
+        }
+    }
+    best.map(|b| b.hmax())
 }
 
 fn search(pf: &Pfam, idx: &Index, path: &str, bar: f32, out: &str, seeds: Option<&String>) {
@@ -577,7 +759,7 @@ const STRIDE: usize = 32; // bytes per profile column: 21 residues, then padding
 /// per tile and scored against every entry of the tile that holds its k-mer. An entry is the row of the
 /// tile's padded profile: model base + column.
 const TILE_ROWS: usize = u16::MAX as usize;
-const SURV_COMPACT: usize = 1 << 22; // survivors held before sorting out repeats: 48 MB per thread
+const SURV_COMPACT: usize = 1 << 22; // survivors held before sorting out repeats: 32 MB per thread
 const SLACK: f32 = 3.0; // bits: quarter-bit rounding moved a whole diagonal by at most 2.1 bits in step 1
 struct Tile {
     m0: usize,
@@ -658,17 +840,31 @@ fn load_tiles(path: &str) -> TileIndex {
     TileIndex { k: h[0] as usize, tiles }
 }
 
-/// One block's postings, 16 lanes at a time: per k-mer, groups of LANES windows stored offset-major
-/// (offset o of lane l at o * LANES + l), WIN residues each, 20 outside the ORF. Unused lanes hold 20
-/// everywhere, so they score nothing, and orf u32::MAX.
+/// One block's postings, LANES at a time: per k-mer, groups of LANES windows stored offset-major
+/// (offset o of lane l at o * LANES + l), WIN residues each, 20 outside the ORF, all plus BIAS. Unused
+/// lanes hold 20 everywhere, so they score nothing, and orf u32::MAX.
+///
+/// LANES is the widest register the architecture's kernel fills with one job: 32 bytes on AVX2, where the
+/// 16-byte halves of a profile column are broadcast, so nothing is assembled from two jobs. Wider groups
+/// are fuller only in larger blocks (hit-weighted, 0.69 full in 300,000 ORFs and 0.93 in 1.6 M).
+#[cfg(target_arch = "x86_64")]
+const LANES: usize = 32;
+#[cfg(not(target_arch = "x86_64"))]
 const LANES: usize = 16;
+/// Added to every residue in a window, so that `pshufb`, which gives 0 for an index with its top bit set,
+/// looks up residues 0..16 as they are (0x70..0x80) and 16..21 with the top bit flipped (0x80..0x85 to
+/// 0..5): the two halves of a column are then joined with an OR.
+const BIAS: u8 = if cfg!(target_arch = "x86_64") { 0x70 } else { 0 };
+/// Bits per lane in a mask, as each architecture's SIMD compare gives them.
+const LANE_BITS: usize = if cfg!(target_arch = "x86_64") { 1 } else { 4 };
+const LANE: u64 = (1 << LANE_BITS) - 1;
 struct Postings {
     gstarts: Vec<u32>, // per k-mer, into groups
     count: Vec<u32>,   // per k-mer, real postings
     windows: Vec<u8>,
     orf: Vec<u32>,
     pos: Vec<u16>,
-    covered: Vec<u64>, // per group, 4 bits per lane whose window holds the whole ORF
+    covered: Vec<u64>, // per group, a mask of the lanes whose window holds the whole ORF
     span: Vec<(u8, u8)>, // per group, the window offsets that hold a residue in some lane
 }
 
@@ -726,7 +922,7 @@ fn postings(orfs: &[&[u8]], k: usize) -> Postings {
     for c in 0..space {
         group_code[gstarts[c] as usize..gstarts[c + 1] as usize].fill(c as u32);
     }
-    let (mut windows, mut orf, mut pos) = (vec![20u8; groups * WIN * LANES], vec![u32::MAX; groups * LANES], vec![0u16; groups * LANES]);
+    let (mut windows, mut orf, mut pos) = (vec![20 + BIAS; groups * WIN * LANES], vec![u32::MAX; groups * LANES], vec![0u16; groups * LANES]);
     let (mut covered, mut span) = (vec![0u64; groups], vec![(WIN as u8, 0u8); groups]);
     windows
         .par_chunks_mut(WIN * LANES)
@@ -746,294 +942,163 @@ fn postings(orfs: &[&[u8]], k: usize) -> Postings {
                 let f = orfs[o as usize];
                 let j = j as usize;
                 // the window holds the whole ORF, so its score is the whole diagonal's
-                *covered |= (((j <= HALF && f.len() <= j + WIN - HALF) as u64) * 0xF) << (4 * lane);
+                *covered |= (((j <= HALF && f.len() <= j + WIN - HALF) as u64) * LANE) << (LANE_BITS * lane);
                 for x in start as usize..end as usize {
-                    w[x * LANES + lane] = f[j + x - HALF].min(20);
+                    w[x * LANES + lane] = f[j + x - HALF].min(20) + BIAS;
                 }
             }
         });
     Postings { gstarts, count, windows, orf, pos, covered, span }
 }
 
-/// Best local score of each lane's window against the profile rows from `row`, in quarter bits. The
-/// scalar version is the oracle: every SIMD version must return the same.
-fn score_scalar(prof: &[i8], row: usize, w: &[u8], out: &mut [i8], span: (usize, usize)) {
-    for lane in 0..w.len() / WIN {
-        let (g, l) = (lane / LANES, lane % LANES);
-        let w = &w[g * WIN * LANES..];
-        let (mut cur, mut best) = (0i8, 0i8);
-        for o in span.0..span.1 {
-            cur = cur.saturating_add(prof[(row + o) * STRIDE + w[o * LANES + l] as usize]).max(0);
-            best = best.max(cur);
-        }
-        out[lane] = best;
-    }
-}
-
-/// NEON: up to 4 groups at once share each profile row's load and hide the add-max chain's latency.
-#[cfg(target_arch = "aarch64")]
-fn score_neon(prof: &[i8], row: usize, w: &[u8], out: &mut [i8], span: (usize, usize)) {
-    let n = w.len() / (WIN * LANES);
-    let mut g = 0;
-    while g < n {
-        let take = (n - g).min(4);
-        let (wg, og) = (&w[g * WIN * LANES..(g + take) * WIN * LANES], &mut out[g * LANES..(g + take) * LANES]);
-        match take {
-            4 => neon_n::<4>(prof, row, wg, og, span),
-            3 => neon_n::<3>(prof, row, wg, og, span),
-            2 => neon_n::<2>(prof, row, wg, og, span),
-            _ => neon_n::<1>(prof, row, wg, og, span),
-        }
-        g += take;
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn neon_n<const N: usize>(prof: &[i8], row: usize, w: &[u8], out: &mut [i8], span: (usize, usize)) {
-    use std::arch::aarch64::*;
-    assert!((row + WIN) * STRIDE <= prof.len() && w.len() >= N * WIN * LANES && out.len() >= N * LANES);
-    unsafe {
-        let zero = vdupq_n_s8(0);
-        let (mut cur, mut best) = ([zero; N], [zero; N]);
-        let p = prof.as_ptr().add(row * STRIDE);
-        for o in span.0..span.1 {
-            let table = vld1q_s8_x2(p.add(o * STRIDE));
-            for i in 0..N {
-                let idx = vld1q_u8(w.as_ptr().add(i * WIN * LANES + o * LANES));
-                cur[i] = vmaxq_s8(vqaddq_s8(cur[i], vqtbl2q_s8(table, idx)), zero);
-                best[i] = vmaxq_s8(best[i], cur[i]);
-            }
-        }
-        for i in 0..N {
-            vst1q_s8(out.as_mut_ptr().add(i * LANES), best[i]);
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.1")]
-unsafe fn score_sse41(prof: &[i8], row: usize, w_all: &[u8], out_all: &mut [i8], span: (usize, usize)) {
-    use std::arch::x86_64::*;
-    assert!((row + WIN) * STRIDE <= prof.len());
-    for g in 0..w_all.len() / (WIN * LANES) {
-    let w = &w_all[g * WIN * LANES..(g + 1) * WIN * LANES];
-    let out = &mut out_all[g * LANES..(g + 1) * LANES];
-    let zero = _mm_setzero_si128();
-    let sixteen = _mm_set1_epi8(16);
-    let fifteen = _mm_set1_epi8(15);
-    let (mut cur, mut best) = (zero, zero);
-    let p = prof.as_ptr().add(row * STRIDE);
-    for o in span.0..span.1 {
-        let lo = _mm_loadu_si128(p.add(o * STRIDE) as *const __m128i);
-        let hi = _mm_loadu_si128(p.add(o * STRIDE + 16) as *const __m128i);
-        let idx = _mm_loadu_si128(w.as_ptr().add(o * LANES) as *const __m128i);
-        let from_lo = _mm_shuffle_epi8(lo, idx); // pshufb uses the low 4 bits
-        let from_hi = _mm_shuffle_epi8(hi, _mm_sub_epi8(idx, sixteen));
-        let s = _mm_blendv_epi8(from_lo, from_hi, _mm_cmpgt_epi8(idx, fifteen));
-        cur = _mm_max_epi8(_mm_adds_epi8(cur, s), zero);
-        best = _mm_max_epi8(best, cur);
-    }
-    _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, best);
-    }
-}
-
-type Scorer = fn(&[i8], usize, &[u8], &mut [i8], (usize, usize));
-
-/// Scores four (profile row, group) jobs at once, each with its own table: independent chains hide the
-/// add-max latency when lists are short. Same results as four calls of the scorer.
-/// Masks: for each job, 4 bits per lane set where the lane's best >= gates.0, and where >= gates.1.
+/// Scores four (profile row, group) jobs at once: best local score of each lane's window, in quarter bits
+/// saturating at 127, against the profile rows from `row`. Gives two masks per job, the lanes whose best
+/// is at least gates.0 and gates.1 (LANE_BITS per lane). Independent chains hide the add-max latency.
+///
+/// In SIMD a score is held less 128, so the saturating add is also the local score's floor. That lets it
+/// run past 127, where the scalar one sticks, but only once it has passed every gate.
 type Masks = [(u64, u64); 4];
-type Scorer4 = fn(&[i8], [usize; 4], [&[u8]; 4], &mut [[i8; LANES]; 4], (usize, usize), (i8, i8), &mut Masks);
+type Scorer4 = fn(&[i8], [usize; 4], [&[u8]; 4], (usize, usize), (i8, i8), &mut Masks);
 
-fn nibbles(out: &[i8; LANES], gate: i8) -> u64 {
-    out.iter().enumerate().fold(0u64, |m, (l, &b)| m | (((b >= gate) as u64) * 0xF) << (4 * l))
-}
-
-fn score4_generic(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
-    let (s, _) = scorer();
+/// The oracle: every SIMD version must return the same.
+fn score4_scalar(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     for i in 0..4 {
-        s(prof, rows[i], &w[i][..WIN * LANES], &mut out[i], span);
-        masks[i] = (nibbles(&out[i], gates.0), nibbles(&out[i], gates.1));
+        masks[i] = (0, 0);
+        for lane in 0..LANES {
+            let (mut cur, mut best) = (0i8, 0i8);
+            for o in span.0..span.1 {
+                cur = cur.saturating_add(prof[(rows[i] + o) * STRIDE + (w[i][o * LANES + lane] - BIAS) as usize]).max(0);
+                best = best.max(cur);
+            }
+            masks[i].0 |= ((best >= gates.0) as u64 * LANE) << (LANE_BITS * lane);
+            masks[i].1 |= ((best >= gates.1) as u64 * LANE) << (LANE_BITS * lane);
+        }
     }
 }
 
 #[cfg(target_arch = "aarch64")]
-fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::aarch64::*;
     for i in 0..4 {
         assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
     }
     unsafe {
-        let zero = vdupq_n_s8(0);
-        let (mut cur, mut best) = ([zero; 4], [zero; 4]);
-        let p = [0, 1, 2, 3].map(|i| prof.as_ptr().add(rows[i] * STRIDE));
+        let (mut cur, mut best) = ([vdupq_n_s8(i8::MIN); 4], [vdupq_n_s8(i8::MIN); 4]);
+        let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
         for o in span.0..span.1 {
             for i in 0..4 {
                 let table = vld1q_s8_x2(p[i].add(o * STRIDE));
                 let idx = vld1q_u8(w[i].as_ptr().add(o * LANES));
-                cur[i] = vmaxq_s8(vqaddq_s8(cur[i], vqtbl2q_s8(table, idx)), zero);
+                cur[i] = vqaddq_s8(cur[i], vqtbl2q_s8(table, idx));
                 best[i] = vmaxq_s8(best[i], cur[i]);
             }
         }
-        let (g0, g1) = (vdupq_n_s8(gates.0), vdupq_n_s8(gates.1));
+        let (g0, g1) = (vdupq_n_s8(gates.0 ^ i8::MIN), vdupq_n_s8(gates.1 ^ i8::MIN));
+        // compare, then narrow each byte to 4 bits: a 64-bit mask with a nibble per lane
+        let mask = |best, gate| vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(vcgeq_s8(best, gate)), 4)), 0);
         for i in 0..4 {
-            vst1q_s8(out[i].as_mut_ptr(), best[i]);
-            // compare, then narrow each byte to 4 bits: a 64-bit mask with a nibble per lane
-            let pass = vreinterpretq_u16_u8(vcgeq_s8(best[i], g0));
-            let high = vreinterpretq_u16_u8(vcgeq_s8(best[i], g1));
-            masks[i] = (vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(pass, 4)), 0),
-                        vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(high, 4)), 0));
+            masks[i] = (mask(best[i], g0), mask(best[i], g1));
         }
     }
 }
 
-/// `pshufb` indexes only 16 bytes, so a 32-entry table lookup takes two shuffles and a blend
-/// where NEON's `vqtbl2q_s8` takes one. That is the only part of the kernel that differs by
-/// architecture: the structure around it -- four jobs in one pass over the window, each table
-/// loaded once, independent accumulator chains, masks in SIMD -- is what makes it fast, and is
-/// the same everywhere.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn nibbles_sse(best: std::arch::x86_64::__m128i, gate: std::arch::x86_64::__m128i) -> u64 {
-    use std::arch::x86_64::*;
-    // best >= gate, without cmpgt's wrap at i8::MIN: 0xFF per passing lane
-    let pass = _mm_cmpeq_epi8(_mm_max_epi8(best, gate), best);
-    // bytes of 0xFF/0x00 to one nibble per lane, as NEON's shift-and-narrow does: a u16 pair
-    // 0xFF00 >> 4 keeps 0xF0 in its low byte, 0x00FF >> 4 keeps 0x0F
-    let sh = _mm_srli_epi16::<4>(pass);
-    let low = _mm_shuffle_epi8(sh, _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1));
-    _mm_cvtsi128_si64(low) as u64
-}
-
+/// `pshufb` indexes 16 bytes, so a 32-entry lookup is two shuffles and an OR (see BIAS) where NEON's
+/// `vqtbl2q_s8` is one instruction. Here 32 lanes are two passes of 16.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
-unsafe fn score4_sse41_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+unsafe fn score4_sse41_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::x86_64::*;
     for i in 0..4 {
         assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
     }
-    let zero = _mm_setzero_si128();
-    let fifteen = _mm_set1_epi8(15);
-    let (mut cur, mut best) = ([zero; 4], [zero; 4]);
-    let p = [0, 1, 2, 3].map(|i| prof.as_ptr().add(rows[i] * STRIDE));
+    let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
+    let flip = _mm_set1_epi8(i8::MIN);
+    let (g0, g1) = (_mm_set1_epi8(gates.0 ^ i8::MIN), _mm_set1_epi8(gates.1 ^ i8::MIN));
+    *masks = [(0, 0); 4];
+    for half in 0..2 {
+        let (mut cur, mut best) = ([flip; 4], [flip; 4]);
+        for o in span.0..span.1 {
+            for i in 0..4 {
+                let col = p[i].add(o * STRIDE) as *const __m128i;
+                let idx = _mm_loadu_si128(w[i].as_ptr().add(o * LANES + half * 16) as *const __m128i);
+                let lo = _mm_shuffle_epi8(_mm_loadu_si128(col), idx);
+                let hi = _mm_shuffle_epi8(_mm_loadu_si128(col.add(1)), _mm_xor_si128(idx, flip));
+                cur[i] = _mm_adds_epi8(cur[i], _mm_or_si128(lo, hi));
+                best[i] = _mm_max_epi8(best[i], cur[i]);
+            }
+        }
+        // best >= gate, as max(best, gate) == best
+        let mask = |best, gate| (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epi8(best, gate), best)) as u32 as u64) << (16 * half);
+        for i in 0..4 {
+            masks[i].0 |= mask(best[i], g0);
+            masks[i].1 |= mask(best[i], g1);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn score4_sse41(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    unsafe { score4_sse41_inner(prof, rows, w, span, gates, masks) }
+}
+
+/// AVX2: one job's 32 lanes per register. `vpshufb` shuffles each 128-bit half with its own table, so both
+/// halves get the same one, broadcast from memory, which costs a load and no shuffle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn score4_avx2_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    use std::arch::x86_64::*;
+    for i in 0..4 {
+        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+    }
+    let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
+    let flip = _mm256_set1_epi8(i8::MIN);
+    let (mut cur, mut best) = ([flip; 4], [flip; 4]);
     for o in span.0..span.1 {
         for i in 0..4 {
             let col = p[i].add(o * STRIDE) as *const __m128i;
-            let idx = _mm_loadu_si128(w[i].as_ptr().add(o * LANES) as *const __m128i);
-            let from_lo = _mm_shuffle_epi8(_mm_loadu_si128(col), idx);
-            let from_hi = _mm_shuffle_epi8(_mm_loadu_si128(col.add(1)), idx);
-            let s = _mm_blendv_epi8(from_lo, from_hi, _mm_cmpgt_epi8(idx, fifteen));
-            cur[i] = _mm_max_epi8(_mm_adds_epi8(cur[i], s), zero);
-            best[i] = _mm_max_epi8(best[i], cur[i]);
+            let idx = _mm256_loadu_si256(w[i].as_ptr().add(o * LANES) as *const __m256i);
+            let lo = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(col)), idx);
+            let hi = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(col.add(1))), _mm256_xor_si256(idx, flip));
+            cur[i] = _mm256_adds_epi8(cur[i], _mm256_or_si256(lo, hi));
+            best[i] = _mm256_max_epi8(best[i], cur[i]);
         }
     }
-    let (g0, g1) = (_mm_set1_epi8(gates.0), _mm_set1_epi8(gates.1));
+    let (g0, g1) = (_mm256_set1_epi8(gates.0 ^ i8::MIN), _mm256_set1_epi8(gates.1 ^ i8::MIN));
+    let mask = |best, gate| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epi8(best, gate), best)) as u32 as u64;
     for i in 0..4 {
-        _mm_storeu_si128(out[i].as_mut_ptr() as *mut __m128i, best[i]);
-        masks[i] = (nibbles_sse(best[i], g0), nibbles_sse(best[i], g1));
+        masks[i] = (mask(best[i], g0), mask(best[i], g1));
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-fn score4_sse41(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
-    unsafe { score4_sse41_inner(prof, rows, w, out, span, gates, masks) }
+fn score4_avx2(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    unsafe { score4_avx2_inner(prof, rows, w, span, gates, masks) }
 }
 
-/// AVX2: two jobs per 256-bit register, since `vpshufb` shuffles each 128-bit half with its own
-/// table. Same instruction count per job as SSE for the lookup, half as many instructions issued,
-/// so about 1.5x -- the limit is `pshufb`'s 16-byte window, not register width. Going wider would
-/// mean 32 lanes, which is a change to the postings layout in `postings`, not to this kernel.
-/// ponytail: two accumulator chains here against NEON's four; if this turns out latency-bound,
-/// the fix is an eight-job batch in `join`, not a different kernel.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn score4_avx2_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
-    use std::arch::x86_64::*;
-    for i in 0..4 {
-        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
-    }
-    let zero = _mm256_setzero_si256();
-    let fifteen = _mm256_set1_epi8(15);
-    let (mut cur, mut best) = ([zero; 2], [zero; 2]);
-    let p = [0, 1, 2, 3].map(|i| prof.as_ptr().add(rows[i] * STRIDE));
-    // pair j holds jobs 2j and 2j+1, in the low and high half
-    // the two halves of a 256-bit register are shuffled independently, so one register holds two
-    // jobs' 16-entry tables, or two jobs' 16 window indices
-    let pack = |a: *const __m128i, b: *const __m128i| -> __m256i {
-        _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(a)), _mm_loadu_si128(b))
-    };
-    for o in span.0..span.1 {
-        for j in 0..2 {
-            let (col_i, col_j) = (p[2 * j].add(o * STRIDE), p[2 * j + 1].add(o * STRIDE));
-            let table_lo = pack(col_i as *const __m128i, col_j as *const __m128i);
-            let table_hi = pack(col_i.add(16) as *const __m128i, col_j.add(16) as *const __m128i);
-            let idx = pack(
-                w[2 * j].as_ptr().add(o * LANES) as *const __m128i,
-                w[2 * j + 1].as_ptr().add(o * LANES) as *const __m128i,
-            );
-            let from_lo = _mm256_shuffle_epi8(table_lo, idx);
-            let from_hi = _mm256_shuffle_epi8(table_hi, idx);
-            let s = _mm256_blendv_epi8(from_lo, from_hi, _mm256_cmpgt_epi8(idx, fifteen));
-            cur[j] = _mm256_max_epi8(_mm256_adds_epi8(cur[j], s), zero);
-            best[j] = _mm256_max_epi8(best[j], cur[j]);
-        }
-    }
-    let (g0, g1) = (_mm_set1_epi8(gates.0), _mm_set1_epi8(gates.1));
-    for j in 0..2 {
-        let halves = [_mm256_castsi256_si128(best[j]), _mm256_extracti128_si256::<1>(best[j])];
-        for (h, half) in halves.iter().enumerate() {
-            let i = 2 * j + h;
-            _mm_storeu_si128(out[i].as_mut_ptr() as *mut __m128i, *half);
-            masks[i] = (nibbles_sse(*half, g0), nibbles_sse(*half, g1));
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn score4_avx2(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
-    unsafe { score4_avx2_inner(prof, rows, w, out, span, gates, masks) }
-}
-
-fn scorer4() -> Scorer4 {
-    // FILTER_SIMD=generic keeps this CPU's per-group kernel but drops the fused four-job one, which
-    // is what x86 had before score4_sse41 and score4_avx2, so that loss stays measurable anywhere.
-    let forced = std::env::var("FILTER_SIMD").unwrap_or_default();
-    if matches!(forced.as_str(), "scalar" | "generic") {
-        return score4_generic;
-    }
+/// Every kernel this CPU has, fastest first. FILTER_SIMD=name forces one.
+fn scorers() -> Vec<(&'static str, Scorer4)> {
+    let mut all: Vec<(&'static str, Scorer4)> = vec![];
     #[cfg(target_arch = "aarch64")]
-    return score4_neon;
+    all.push(("neon", score4_neon));
     #[cfg(target_arch = "x86_64")]
     {
-        // FILTER_SIMD=sse4.1 forces the narrower kernel on a machine that has AVX2, to measure it
-        if is_x86_feature_detected!("avx2") && forced != "sse4.1" {
-            return score4_avx2;
+        if is_x86_feature_detected!("avx2") {
+            all.push(("avx2", score4_avx2));
         }
         if is_x86_feature_detected!("sse4.1") {
-            return score4_sse41;
+            all.push(("sse4.1", score4_sse41));
         }
     }
-    #[allow(unreachable_code)]
-    score4_generic
+    all.push(("scalar", score4_scalar));
+    all
 }
 
-/// The fastest scorer this CPU has, unless FILTER_SIMD=scalar (FILTER_SIMD=generic keeps it).
-fn scorer() -> (Scorer, &'static str) {
-    if std::env::var("FILTER_SIMD").as_deref() == Ok("scalar") {
-        return (score_scalar, "scalar");
+fn scorer4() -> (&'static str, Scorer4) {
+    let all = scorers();
+    match std::env::var("FILTER_SIMD") {
+        Ok(want) if !want.is_empty() => *all.iter().find(|(name, _)| *name == want).unwrap_or_else(|| panic!("no {want} kernel on this CPU")),
+        _ => all[0],
     }
-    #[cfg(target_arch = "aarch64")]
-    return (score_neon, "neon");
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("sse4.1") {
-        fn sse(p: &[i8], r: usize, w: &[u8], o: &mut [i8], span: (usize, usize)) {
-            unsafe { score_sse41(p, r, w, o, span) }
-        }
-        return (sse, "sse4.1");
-    }
-    #[allow(unreachable_code)]
-    (score_scalar, "scalar")
 }
 
 /// A model's profile in quarter bits, int8, STRIDE bytes per column, with HALF columns of padding before
@@ -1059,8 +1124,8 @@ fn diagonal(pf: &Pfam, m: usize, col: usize, f: &[u8], j: usize) -> f32 {
     let mut at = (a + col - back) * 21;
     let (mut cur, mut best) = (0.0f32, 0.0f32);
     for &r in &f[j - back..j - back + len] {
-        cur = (cur + pf.lo[at + r as usize]).max(0.0);
-        best = best.max(cur);
+        cur = fmax(cur + pf.lo[at + r as usize], 0.0);
+        best = fmax(best, cur);
         at += 21;
     }
     best
@@ -1071,6 +1136,8 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     let mut lines = std::io::BufReader::with_capacity(1 << 20, fs::File::open(path).unwrap()).lines();
     let mut n_orfs = 0usize;
     let gate = (gate_bits * 4.0).round() as i8;
+    // a survivor is model << 48 | ORF << 17 | diagonal key, so it sorts as one integer
+    assert!(pf.models() < 1 << 16 && block < 1 << 31);
     // gapped score in a band of +-8 around the best diagonal (step 4); FILTER_BAND=b or =whole to change it
     let band: Option<i64> = match std::env::var("FILTER_BAND").as_deref() { Ok("whole") => None, Ok(v) => Some(v.parse().unwrap()), Err(_) => Some(8) };
     // FILTER_DROP=n: skip the n k-mers with the longest lists in the index (promiscuous k-mers, from the
@@ -1095,11 +1162,12 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     // at the diagonal bar but below the hand-off are not formatted and written (324 M rows at diagonal 17).
     // Half a printed digit lower, so a score that prints as g is kept and readers' cut on the text decides.
     let min_gapped: f32 = std::env::var("FILTER_MIN_GAPPED").map_or(f32::NEG_INFINITY, |v| v.parse::<f32>().unwrap() - 0.005);
-    let (score, engine) = scorer();
-    let score4 = scorer4();
+    let bound = if band == Some(BAND) { Bound::new(pf, min_gapped) } else { None };
+    let bounded = AtomicU64::new(0); // pairs the bound lets through to the f32 score
+    let (engine, score4) = scorer4();
     let (hits, survivors, pairs_n) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
-    let (surv_ns, unique) = (AtomicU64::new(0), AtomicU64::new(0)); // sort, dedupe and exact diagonals
-    let (mut t_post, mut t_join, mut t_gap) = (0.0f64, 0.0f64, 0.0f64);
+    let (surv_ns, unique, gap_ns) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)); // surv: sort, dedupe and exact diagonals
+    let (mut t_post, mut t_join) = (0.0f64, 0.0f64);
     let mut sink = std::io::BufWriter::new(fs::File::create(out).unwrap());
     let threads = rayon::current_num_threads() as f64;
     let t0 = Instant::now();
@@ -1117,10 +1185,11 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         eprintln!("block of {} ORFs: {} postings in {} groups, lanes filled {:.3}, {:.0} MB", chunk.len(), real,
             p.gstarts.last().unwrap(), real as f64 / (*p.gstarts.last().unwrap() as f64 * LANES as f64), p.windows.len() as f64 / 1e6);
         let t = Instant::now();
-        // (orf, model, diagonal score) for diagonals that pass the gate and reach the bar
-        let found: Vec<(u32, u32, f32, i64)> = ti.tiles
+        // each tile's pairs are scored and formatted before the next tile's are found, so a block holds its
+        // text, not its pairs
+        let rows: Vec<String> = ti.tiles
             .par_iter()
-            .map_init(|| (Vec::<i8>::new(), Vec::<(u32, u32, u32)>::new()), |(prof, surv), tile| {
+            .map_init(|| (Vec::<i8>::new(), Vec::<u64>::new(), vec![], vec![]), |(prof, surv, h, del), tile| {
                 let base = tile_bases(pf, tile.m0, tile.m1);
                 prof.clear();
                 for m in tile.m0..tile.m1 {
@@ -1135,10 +1204,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 let mut n_hits = 0u64;
                 let mut jobs = [(0usize, 0usize); 4];
                 let mut queued = 0usize;
-                let mut out = [[0i8; LANES]; 4];
                 let mut masks: Masks = [(0, 0); 4];
                 let mut span = (WIN, 0usize);
-                let drain = |jobs: &[(usize, usize)], masks: &Masks, surv: &mut Vec<(u32, u32, u32)>| {
+                let drain = |jobs: &[(usize, usize)], masks: &Masks, surv: &mut Vec<u64>| {
                     for (i, &(row, g)) in jobs.iter().enumerate() {
                         // lanes that pass: the gate, or for a window holding its whole ORF the bar less
                         // SLACK, as that window already scores the whole diagonal to within rounding
@@ -1150,11 +1218,12 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         let m = row_model[row];
                         let c = row - base[m as usize - tile.m0];
                         while mask != 0 {
-                            let lane = mask.trailing_zeros() as usize / 4;
-                            mask &= !(0xFu64 << (4 * lane));
+                            let lane = mask.trailing_zeros() as usize / LANE_BITS;
+                            mask &= !(LANE << (LANE_BITS * lane));
                             let q = g * LANES + lane;
                             // diagonal key: column minus read position, offset to stay positive
-                            surv.push((m, p.orf[q], (c as u32 + 65536) - p.pos[q] as u32));
+                            let key = (c as u32 + 65536) - p.pos[q] as u32;
+                            surv.push((m as u64) << 48 | (p.orf[q] as u64) << 17 | key as u64);
                         }
                     }
                     // a diagonal survives once per k-mer on it: compact before the list grows large
@@ -1180,7 +1249,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             span = (span.0.min(p.span[g].0 as usize), span.1.max(p.span[g].1 as usize));
                             if queued == 4 {
                                 let w = jobs.map(|(_, g)| &p.windows[g * WIN * LANES..(g + 1) * WIN * LANES]);
-                                score4(prof, jobs.map(|(r, _)| r), w, &mut out, span, (gate, covered_gate), &mut masks);
+                                score4(prof, jobs.map(|(r, _)| r), w, span, (gate, covered_gate), &mut masks);
                                 drain(&jobs, &masks, surv);
                                 queued = 0;
                                 span = (WIN, 0);
@@ -1188,11 +1257,13 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         }
                     }
                 }
-                for i in 0..queued {
-                    let (r, g) = jobs[i];
-                    let sp = (p.span[g].0 as usize, p.span[g].1 as usize);
-                    score(prof, r, &p.windows[g * WIN * LANES..(g + 1) * WIN * LANES], &mut out[i], sp);
-                    masks[i] = (nibbles(&out[i], gate), nibbles(&out[i], covered_gate));
+                if queued > 0 {
+                    // the last few jobs: the first pads them to four
+                    for j in queued..4 {
+                        jobs[j] = jobs[0];
+                    }
+                    let w = jobs.map(|(_, g)| &p.windows[g * WIN * LANES..(g + 1) * WIN * LANES]);
+                    score4(prof, jobs.map(|(r, _)| r), w, span, (gate, covered_gate), &mut masks);
                 }
                 drain(&jobs[..queued], &masks, surv);
                 hits.fetch_add(n_hits, Relaxed);
@@ -1202,7 +1273,8 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 surv.dedup();
                 unique.fetch_add(surv.len() as u64, Relaxed);
                 let mut res: Vec<(u32, u32, f32, i64)> = vec![];
-                for &(m, o, key) in surv.iter() {
+                for &x in surv.iter() {
+                    let (m, o, key) = ((x >> 48) as u32, (x >> 17) as u32 & 0x7fff_ffff, x as u32 & 0x1ffff);
                     let f = chunk[o as usize];
                     let cols = (pf.offs[m as usize + 1] - pf.offs[m as usize]) as usize;
                     let d = key as i64 - 65536; // column - position
@@ -1225,40 +1297,52 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                     }
                 }
                 surv_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
-                res
+                let ts = Instant::now();
+                use std::fmt::Write;
+                let (mut text, mut n) = (String::new(), 0u64);
+                for four in res.chunks(PAIRS) {
+                    let reach = bound.as_ref().map_or([true; PAIRS], |b| {
+                        // a short last chunk repeats its first pair
+                        b.may_reach(std::array::from_fn(|i| {
+                            let &(o, m, _, diag) = four.get(i).unwrap_or(&four[0]);
+                            (m as usize, chunk[o as usize], diag)
+                        }))
+                    });
+                    for (&(o, m, d, diag), _) in four.iter().zip(reach).filter(|(_, r)| *r) {
+                        let (name, f) = (orfs.name(o as usize), chunk[o as usize]);
+                        n += 1;
+                        let a = pf.offs[m as usize] as usize;
+                        let cols = pf.offs[m as usize + 1] as usize - a;
+                        let g = match band {
+                            Some(b) => gapped_band(&pf.lo, a, cols, f, diag, b, h, del),
+                            None => gapped(&pf.lo, a, cols, f, h, del),
+                        };
+                        if g >= min_gapped {
+                            writeln!(text, "{name}\t{m}\t{d:.2}\t{g:.2}").unwrap();
+                        }
+                    }
+                }
+                bounded.fetch_add(n, Relaxed);
+                pairs_n.fetch_add(res.len() as u64, Relaxed);
+                gap_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
+                text
             })
-            .flatten()
             .collect();
         t_join += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        pairs_n.fetch_add(found.len() as u64, Relaxed);
-        let rows: Vec<String> = found
-            .par_iter()
-            .map_init(|| (vec![], vec![]), |(h, del), &(o, m, d, diag)| -> Option<String> {
-                let (name, f) = (orfs.name(o as usize), chunk[o as usize]);
-                let a = pf.offs[m as usize] as usize;
-                let cols = pf.offs[m as usize + 1] as usize - a;
-                let g = match band {
-                    Some(b) => gapped_band(&pf.lo, a, cols, f, diag, b, h, del),
-                    None => gapped(&pf.lo, a, cols, f, h, del),
-                };
-                (g >= min_gapped).then(|| format!("{name}\t{m}\t{d:.2}\t{g:.2}\n"))
-            })
-            .flatten()
-            .collect();
         for r in rows {
             sink.write_all(r.as_bytes()).unwrap();
         }
-        t_gap += t.elapsed().as_secs_f64();
     }
     sink.flush().unwrap();
     let wall = t0.elapsed().as_secs_f64();
     let h = hits.load(Relaxed) as f64;
+    let (surv_s, gap_s) = (surv_ns.load(Relaxed) as f64 / 1e9, gap_ns.load(Relaxed) as f64 / 1e9);
+    let join_s = t_join * threads - gap_s; // the survivor stage is part of it, and so is waiting for the last tile
     eprintln!(
         "{engine}: {} ORFs, {:.1}s wall on {threads} threads, {:.0} core-s; postings {:.1} s wall, join {:.1} core-s, gapped {:.1} core-s; \
-         {} hits, {:.1} ns per hit (join core time), {} survivors ({:.4}), {} unique diagonals, survivor stage {:.1} core-s, {} pairs",
-        n_orfs, wall, wall * threads, t_post, t_join * threads, t_gap * threads,
-        h as u64, t_join * threads * 1e9 / h.max(1.0), survivors.load(Relaxed), survivors.load(Relaxed) as f64 / h.max(1.0), unique.load(Relaxed), surv_ns.load(Relaxed) as f64 / 1e9, pairs_n.load(Relaxed)
+         {} hits, {:.1} ns per hit (join core time), {} survivors ({:.4}), {} unique diagonals, survivor stage {:.1} core-s, {} pairs, {} scored gapped",
+        n_orfs, wall, wall * threads, t_post, join_s, gap_s,
+        h as u64, join_s * 1e9 / h.max(1.0), survivors.load(Relaxed), survivors.load(Relaxed) as f64 / h.max(1.0), unique.load(Relaxed), surv_s, pairs_n.load(Relaxed), bounded.load(Relaxed)
     );
 }
 
@@ -1295,57 +1379,74 @@ mod tests {
     }
 
     #[test]
-    fn simd_scores_equal_scalar() {
-        // random profile rows and windows, including padding and residue 20
-        let mut x = 12345u64;
+    fn every_kernel_equals_scalar() {
+        let mut x = 99u64;
         let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
-        let rows = 3 * WIN;
-        let prof: Vec<i8> = (0..rows * STRIDE).map(|i| if i % STRIDE >= 20 { i8::MIN } else { (next() % 60) as i8 - 30 }).collect();
-        let (simd, name) = scorer();
-        for t in 0..200 {
-            let groups = 1 + t % 7;
-            let w: Vec<u8> = (0..groups * WIN * LANES).map(|_| (next() % 21) as u8).collect();
-            let row = (next() % (2 * WIN as u64)) as usize;
-            let (mut a, mut b) = (vec![0i8; groups * LANES], vec![0i8; groups * LANES]);
-            let sp = ((next() % 10) as usize, WIN - (next() % 10) as usize);
-            score_scalar(&prof, row, &w, &mut a, sp);
-            simd(&prof, row, &w, &mut b, sp);
-            assert_eq!(a, b, "{name}");
+        // scores up to 60 a column, so some lanes saturate
+        let prof: Vec<i8> = (0..3 * WIN * STRIDE).map(|i| if i % STRIDE >= 20 { i8::MIN } else { (next() % 90) as i8 - 30 }).collect();
+        for t in 0..400 {
+            // residues and padding, or only well-scoring ones
+            let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..WIN * LANES).map(|_| (next() % 21) as u8 + BIAS).collect()).collect();
+            let w = [&ws[0][..], &ws[1][..], &ws[2][..], &ws[3][..]];
+            let rows = [0, 1, 2, 3].map(|_| (next() % (2 * WIN as u64)) as usize);
+            let (span, gates) = (((next() % 10) as usize, WIN - (next() % 10) as usize), ([66, 10, 127, 0][t % 4], [68, 127, 100, 40][t % 4]));
+            let mut want: Masks = [(0, 0); 4];
+            score4_scalar(&prof, rows, w, span, gates, &mut want);
+            for (name, kernel) in scorers() {
+                let mut got: Masks = [(0, 0); 4];
+                kernel(&prof, rows, w, span, gates, &mut got);
+                assert_eq!(got, want, "{name}");
+            }
         }
     }
 
     #[test]
-    fn score4_equals_scalar() {
-        let mut x = 99u64;
+    fn bound_never_drops_what_the_band_keeps() {
+        let mut x = 7u64;
         let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
-        let prof: Vec<i8> = (0..3 * WIN * STRIDE).map(|i| if i % STRIDE >= 20 { i8::MIN } else { (next() % 60) as i8 - 30 }).collect();
-        for _ in 0..100 {
-            let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..WIN * LANES).map(|_| (next() % 21) as u8).collect()).collect();
-            let rows = [0, 1, 2, 3].map(|_| (next() % (2 * WIN as u64)) as usize);
-            // every kernel this CPU has, not just the one scorer4() dispatches to, so the x86
-            // pair is both checked wherever the tests run on x86
-            let mut kernels: Vec<(&str, Scorer4)> = vec![("generic", score4_generic), ("dispatched", scorer4())];
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("sse4.1") {
-                    kernels.push(("sse4.1", score4_sse41));
-                }
-                if is_x86_feature_detected!("avx2") {
-                    kernels.push(("avx2", score4_avx2));
-                }
+        // models with a strong residue per column; reads that copy a stretch with gaps and changes
+        let lens = [9usize, 40, 130];
+        let mut offs = vec![0u32];
+        let mut lo = vec![];
+        let mut top: Vec<Vec<u8>> = vec![];
+        for n in lens {
+            let t: Vec<u8> = (0..n).map(|_| (next() % 20) as u8).collect();
+            for &best in &t {
+                lo.extend((0..21u8).map(|r| if r == best { 2.0 + (next() % 200) as f32 / 100.0 } else { -(next() as u32 as f32 / u32::MAX as f32) * 3.0 }));
             }
-            for (name, k) in kernels {
-                let mut a = [[0i8; LANES]; 4];
-                let mut masks: Masks = [(0, 0); 4];
-                k(&prof, rows, [&ws[0][..], &ws[1][..], &ws[2][..], &ws[3][..]], &mut a, (3, WIN - 2), (10, 40), &mut masks);
-                for i in 0..4 {
-                    let mut b = [0i8; LANES];
-                    score_scalar(&prof, rows[i], &ws[i], &mut b, (3, WIN - 2));
-                    assert_eq!(a[i], b, "{name} job {i}");
-                    assert_eq!(masks[i], (nibbles(&b, 10), nibbles(&b, 40)), "{name} masks {i}");
+            offs.push(offs.last().unwrap() + n as u32);
+            top.push(t);
+        }
+        let pf = Pfam { lo, offs };
+        let (mut kept, mut dropped) = (0, 0);
+        for min in [17.0f32, 21.25, 26.25] {
+            let Some(b) = Bound::new(&pf, min - 0.005) else { return }; // no SIMD here
+            let (mut h, mut del) = (vec![], vec![]);
+            for _ in 0..3000 {
+                let mut pairs: Vec<(usize, Vec<u8>, i64)> = vec![];
+                for _ in 0..PAIRS {
+                    let m = (next() % 3) as usize;
+                    let (mut f, mut c) = (vec![], (next() % lens[m] as u64) as usize);
+                    let d = c as i64 - (next() % 5) as i64 + (next() % 21) as i64 - 10;
+                    while f.len() < 1 + (next() % 60) as usize {
+                        match next() % 12 {
+                            0 => c += (next() % 4) as usize,
+                            1..=3 => f.push((next() % 21) as u8),
+                            _ => f.push(top[m].get(c).copied().unwrap_or(20)),
+                        }
+                        c += 1;
+                    }
+                    pairs.push((m, f, d));
+                }
+                let reach = b.may_reach(std::array::from_fn(|i| (pairs[i].0, &pairs[i].1[..], pairs[i].2)));
+                for ((m, f, d), reach) in pairs.iter().zip(reach) {
+                    let g = gapped_band(&pf.lo, pf.offs[*m] as usize, lens[*m], f, *d, BAND, &mut h, &mut del);
+                    assert!(reach || g < min - 0.005, "dropped {g} at {min}");
+                    (kept, dropped) = (kept + (g >= min) as usize, dropped + !reach as usize);
                 }
             }
         }
+        assert!(kept > 100 && dropped > 100, "{kept} kept, {dropped} dropped: the test has stopped testing");
     }
 
     #[test]

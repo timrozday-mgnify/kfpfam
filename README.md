@@ -25,7 +25,7 @@ Local data goes in `data/` (not tracked). Pfam-A comes from
 ## Filter
 
 `filter/` is the pre-filter in Rust: an index of every 4-mer scoring at least 7 bits at a column, joined
-to blocks of reads from the model's side with SIMD (NEON, or SSE4.1 on x86), then an exact diagonal and
+to blocks of reads from the model's side with SIMD (NEON, or AVX2 on x86), then an exact diagonal and
 a banded gapped score on what passes. On one human gut metagenome (1.07 M reads, M4 Pro, 6 threads) it
 takes about 0.7 core-ms per read, and with HMMER on its candidates about 0.9 (Mode A's old settings), against 1.2–2.0 for nail,
 with higher recall below GA. See the plan's Speed plan and Progress log.
