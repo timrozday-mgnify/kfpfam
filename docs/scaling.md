@@ -255,6 +255,25 @@ arm took 585). Both are against 53,275 models, and projections from one chunk; n
 The lever left is fewer residues. The pipeline's ORF filter kept 62% of them for 0.18% of reads, and
 the filter is linear in residues, so about 155 and 70 cpu-h if that holds for kfpfam. Not run with it.
 
+### The bound at ±16 (2026-11-23)
+
+`FILTER_BAND` up to 16 now has a bound too: 32 lanes, one AVX2 register on x86 and two on NEON. Before, anything but 8 went
+straight to the f32 score. The 16-lane gap step takes its cost off in two halves, as 16 extensions don't fit in a byte. A
+band between gets the next bound up, since a wider band only raises a score.
+
+311,680 merged-fragment ORFs, Pfam 38.2, k = 3 with a T per model, M4 Pro, 4 threads, `FILTER_MIN_GAPPED` 21.25; the pairs written are the same byte for byte:
+
+| | core-s | gapped | scored gapped |
+|---|---|---|---|
+| bar 15, gate 14.5, ±16 | 153 → **90** | 82.8 → 20.4 | 68.8 M → 3.9 M |
+| bar 16, gate 15.5, ±16 | 103 → **74** | 41.7 → 12.0 | 33.9 M → 3.1 M |
+| bar 15, gate 14.5, ±12 | 134 → 89 | 64.1 → 19.0 | 68.8 M → 3.9 M |
+| Mode A, ±8 | 63 → 62 | 5.2 → 5.1 | unchanged |
+
+The unit test covers bands 3, 8, 12 and 16, at a bar high enough (26 bits and up) for a gap of more than 16 columns to pay, and fails on each of twelve deliberate
+faults in the step, the edges and the joins between registers (nine on ARM, three in the AVX2 code). It passes 25.6 M random pairs on ARM. Under Rosetta the AVX2 build passes it and
+writes ARM's pairs on 4,000 ORFs. Not timed on x86.
+
 ## Ranked plan
 
 | # | Change | Expected | Recall cost | Effort |
@@ -263,6 +282,7 @@ the filter is linear in residues, so about 155 and 70 cpu-h if that holds for kf
 | 2a | AVX2, two jobs per register | 1.13× beyond #1 on Codon | **none** | **done**, replaced by 2b |
 | 2b | 32 lanes, one job per AVX2 register | 1.3–1.9× beyond #2a (predicted) | **none** | **done**: join 167 → 123 core-s on Codon at 400,000 per block |
 | 2c | SIMD bound before the gapped score | 6.6× on that stage on Codon | **none** | **done** |
+| 2c′ | The same at a band of ±16 | 4× on that stage on ARM | **none** | **done**, not timed on x86 |
 | 2d | AVX-512 VBMI | 1.13× on the join on Codon | **none** | **done** |
 | 2e | Four rows against every group; smaller tiles | none on Codon; smaller tiles slower | **none** | loop kept, tiles dropped |
 | 2f | The pipeline's ORF filter in front | 1.6× | 0.18% of reads with `hmmsearch` | config only; not run with kfpfam |

@@ -263,21 +263,27 @@ fn gapped_band(lo: &[f32], a: usize, cols: usize, f: &[u8], d: i64, band: i64, h
     best
 }
 
-/// What the gapped bound needs of a SIMD register: 16 signed bytes.
+/// What the gapped bound needs of a SIMD register: LANES signed bytes.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-trait Bytes16: Copy {
+trait Bytes: Copy {
+    const LANES: usize;
     unsafe fn load(p: *const i8) -> Self;
     unsafe fn splat(v: i8) -> Self;
     unsafe fn adds(self, o: Self) -> Self;
     unsafe fn subs(self, o: Self) -> Self;
     unsafe fn max(self, o: Self) -> Self;
     unsafe fn min(self, o: Self) -> Self;
-    /// Bytes N..N + 16 of self followed by o.
-    unsafe fn ext<const N: i32>(self, o: Self) -> Self;
+    /// Every byte N lanes up, N a power of two of at most half the lanes, with `below`'s last N bytes under them.
+    unsafe fn raise<const N: usize>(self, below: Self) -> Self;
+    /// Every byte one lane down, with `above`'s first byte over them.
+    unsafe fn lower(self, above: Self) -> Self;
+    /// The last byte in the first lane.
+    unsafe fn last_first(self) -> Self;
     unsafe fn hmax(self) -> i8;
 }
 #[cfg(target_arch = "aarch64")]
-impl Bytes16 for std::arch::aarch64::int8x16_t {
+impl Bytes for std::arch::aarch64::int8x16_t {
+    const LANES: usize = 16;
     #[inline(always)]
     unsafe fn load(p: *const i8) -> Self { std::arch::aarch64::vld1q_s8(p) }
     #[inline(always)]
@@ -291,12 +297,56 @@ impl Bytes16 for std::arch::aarch64::int8x16_t {
     #[inline(always)]
     unsafe fn min(self, o: Self) -> Self { std::arch::aarch64::vminq_s8(self, o) }
     #[inline(always)]
-    unsafe fn ext<const N: i32>(self, o: Self) -> Self { std::arch::aarch64::vextq_s8::<N>(self, o) }
+    unsafe fn raise<const N: usize>(self, below: Self) -> Self {
+        use std::arch::aarch64::vextq_s8;
+        match N {
+            1 => vextq_s8::<15>(below, self),
+            2 => vextq_s8::<14>(below, self),
+            4 => vextq_s8::<12>(below, self),
+            8 => vextq_s8::<8>(below, self),
+            _ => unreachable!(),
+        }
+    }
+    #[inline(always)]
+    unsafe fn lower(self, above: Self) -> Self { std::arch::aarch64::vextq_s8::<1>(self, above) }
+    #[inline(always)]
+    unsafe fn last_first(self) -> Self { std::arch::aarch64::vextq_s8::<15>(self, self) }
     #[inline(always)]
     unsafe fn hmax(self) -> i8 { std::arch::aarch64::vmaxvq_s8(self) }
 }
+/// Two registers as one, for a CPU without a wider one.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct Two<V>(V, V);
+#[cfg(target_arch = "aarch64")]
+impl<V: Bytes> Bytes for Two<V> {
+    const LANES: usize = 2 * V::LANES;
+    #[inline(always)]
+    unsafe fn load(p: *const i8) -> Self { Two(V::load(p), V::load(p.add(V::LANES))) }
+    #[inline(always)]
+    unsafe fn splat(v: i8) -> Self { Two(V::splat(v), V::splat(v)) }
+    #[inline(always)]
+    unsafe fn adds(self, o: Self) -> Self { Two(self.0.adds(o.0), self.1.adds(o.1)) }
+    #[inline(always)]
+    unsafe fn subs(self, o: Self) -> Self { Two(self.0.subs(o.0), self.1.subs(o.1)) }
+    #[inline(always)]
+    unsafe fn max(self, o: Self) -> Self { Two(self.0.max(o.0), self.1.max(o.1)) }
+    #[inline(always)]
+    unsafe fn min(self, o: Self) -> Self { Two(self.0.min(o.0), self.1.min(o.1)) }
+    #[inline(always)]
+    unsafe fn raise<const N: usize>(self, below: Self) -> Self {
+        if N == V::LANES { Two(below.1, self.0) } else { Two(self.0.raise::<N>(below.1), self.1.raise::<N>(self.0)) }
+    }
+    #[inline(always)]
+    unsafe fn lower(self, above: Self) -> Self { Two(self.0.lower(self.1), self.1.lower(above.0)) }
+    #[inline(always)]
+    unsafe fn last_first(self) -> Self { Two(self.1.last_first(), self.1) }
+    #[inline(always)]
+    unsafe fn hmax(self) -> i8 { self.0.max(self.1).hmax() }
+}
 #[cfg(target_arch = "x86_64")]
-impl Bytes16 for std::arch::x86_64::__m128i {
+impl Bytes for std::arch::x86_64::__m128i {
+    const LANES: usize = 16;
     #[inline(always)]
     unsafe fn load(p: *const i8) -> Self { std::arch::x86_64::_mm_loadu_si128(p as *const _) }
     #[inline(always)]
@@ -310,7 +360,20 @@ impl Bytes16 for std::arch::x86_64::__m128i {
     #[inline(always)]
     unsafe fn min(self, o: Self) -> Self { std::arch::x86_64::_mm_min_epi8(self, o) }
     #[inline(always)]
-    unsafe fn ext<const N: i32>(self, o: Self) -> Self { std::arch::x86_64::_mm_alignr_epi8::<N>(o, self) }
+    unsafe fn raise<const N: usize>(self, below: Self) -> Self {
+        use std::arch::x86_64::_mm_alignr_epi8;
+        match N {
+            1 => _mm_alignr_epi8::<15>(self, below),
+            2 => _mm_alignr_epi8::<14>(self, below),
+            4 => _mm_alignr_epi8::<12>(self, below),
+            8 => _mm_alignr_epi8::<8>(self, below),
+            _ => unreachable!(),
+        }
+    }
+    #[inline(always)]
+    unsafe fn lower(self, above: Self) -> Self { std::arch::x86_64::_mm_alignr_epi8::<1>(above, self) }
+    #[inline(always)]
+    unsafe fn last_first(self) -> Self { std::arch::x86_64::_mm_srli_si128::<15>(self) }
     #[inline(always)]
     unsafe fn hmax(self) -> i8 {
         let mut b = [0i8; 16];
@@ -318,23 +381,69 @@ impl Bytes16 for std::arch::x86_64::__m128i {
         b.into_iter().max().unwrap()
     }
 }
+#[cfg(target_arch = "x86_64")]
+impl Bytes for std::arch::x86_64::__m256i {
+    const LANES: usize = 32;
+    #[inline(always)]
+    unsafe fn load(p: *const i8) -> Self { std::arch::x86_64::_mm256_loadu_si256(p as *const _) }
+    #[inline(always)]
+    unsafe fn splat(v: i8) -> Self { std::arch::x86_64::_mm256_set1_epi8(v) }
+    #[inline(always)]
+    unsafe fn adds(self, o: Self) -> Self { std::arch::x86_64::_mm256_adds_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn subs(self, o: Self) -> Self { std::arch::x86_64::_mm256_subs_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn max(self, o: Self) -> Self { std::arch::x86_64::_mm256_max_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn min(self, o: Self) -> Self { std::arch::x86_64::_mm256_min_epi8(self, o) }
+    #[inline(always)]
+    unsafe fn raise<const N: usize>(self, below: Self) -> Self {
+        use std::arch::x86_64::{_mm256_alignr_epi8, _mm256_permute2x128_si256};
+        // alignr works within each half, so it needs what is under each: below's upper half, self's lower one
+        let under = _mm256_permute2x128_si256::<0x21>(below, self);
+        match N {
+            1 => _mm256_alignr_epi8::<15>(self, under),
+            2 => _mm256_alignr_epi8::<14>(self, under),
+            4 => _mm256_alignr_epi8::<12>(self, under),
+            8 => _mm256_alignr_epi8::<8>(self, under),
+            16 => under,
+            _ => unreachable!(),
+        }
+    }
+    #[inline(always)]
+    unsafe fn lower(self, above: Self) -> Self {
+        use std::arch::x86_64::{_mm256_alignr_epi8, _mm256_permute2x128_si256};
+        _mm256_alignr_epi8::<1>(_mm256_permute2x128_si256::<0x21>(self, above), self)
+    }
+    #[inline(always)]
+    unsafe fn last_first(self) -> Self {
+        use std::arch::x86_64::{_mm256_permute2x128_si256, _mm256_srli_si256};
+        _mm256_permute2x128_si256::<0x11>(_mm256_srli_si256::<15>(self), self)
+    }
+    #[inline(always)]
+    unsafe fn hmax(self) -> i8 {
+        use std::arch::x86_64::{_mm256_castsi256_si128, _mm256_extracti128_si256};
+        Bytes::max(_mm256_castsi256_si128(self), _mm256_extracti128_si256::<1>(self)).hmax()
+    }
+}
 
 /// An upper bound on gapped_band's score, in bytes, one read residue per step with the band in one
 /// register, so a pair that cannot reach `min` is dropped without the f32 matrix. Scores are rounded up,
-/// gap costs down and the band's 17th column is merged into the 16th, so it never drops a pair
-/// gapped_band would keep.
+/// gap costs down and the band's odd last column is merged into the one before it, so it never drops a pair
+/// gapped_band would keep. The band is 8 or 16 columns either way, the narrower that holds the one
+/// asked for: a wider band only raises a score.
 struct Bound {
     prof: Vec<i8>, // per model, 21 residues x (PAD + columns + PAD), residue-major
     at: Vec<usize>,
     scale: f32,
     pass: i8, // the lowest bound that may reach min, offset by -128
+    wide: bool, // a band of 16, not 8
 }
-const PAD: usize = 24; // columns either side of a model: the band may hang off both ends
-const BAND: i64 = 8;
+const PAD: usize = 40; // columns either side of a model: the band may hang off both ends
 impl Bound {
-    /// None when there is nothing to bound (no min), or no SIMD for it here.
-    fn new(pf: &Pfam, min: f32) -> Option<Bound> {
-        if !(16.0..=250.0).contains(&min) || std::env::var("FILTER_SIMD").as_deref() == Ok("scalar") {
+    /// None when there is nothing to bound (no min), or no SIMD for it or for a band this wide here.
+    fn new(pf: &Pfam, min: f32, band: i64) -> Option<Bound> {
+        if !(16.0..=250.0).contains(&min) || !(0..=16).contains(&band) || std::env::var("FILTER_SIMD").as_deref() == Ok("scalar") {
             return None;
         }
         #[cfg(target_arch = "x86_64")]
@@ -364,21 +473,28 @@ impl Bound {
                 }
             }
         });
-        Some(Bound { prof, at, scale, pass: ((min * scale - 0.01).floor() - 128.0) as i8 })
+        Some(Bound { prof, at, scale, pass: ((min * scale - 0.01).floor() - 128.0) as i8, wide: band > 8 })
     }
     /// Whether each pair (model, read, diagonal as column - read position) may reach min.
     fn may_reach(&self, pairs: [(usize, &[u8], i64); PAIRS]) -> [bool; PAIRS] {
         let jobs = pairs.map(|(m, f, d)| (&self.prof[self.at[m]..self.at[m + 1]], f, d));
         #[cfg(target_arch = "aarch64")]
-        return unsafe { bound::<std::arch::aarch64::int8x16_t>(jobs, self.scale) }.map(|b| b >= self.pass);
+        {
+            use std::arch::aarch64::int8x16_t;
+            // SAFETY: NEON is part of aarch64, and a job's rows have PAD columns either side
+            let best = unsafe { if self.wide { bound::<Two<int8x16_t>>(jobs, self.scale) } else { bound::<int8x16_t>(jobs, self.scale) } };
+            return best.map(|b| b >= self.pass);
+        }
         #[cfg(target_arch = "x86_64")]
         {
-            // AVX2 for its three-operand encoding; the registers are 16 bytes either way
+            // AVX2 for the wide band's registers, and for its three-operand encoding in the narrow one
             #[target_feature(enable = "avx2")]
-            unsafe fn run(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
-                bound::<std::arch::x86_64::__m128i>(jobs, scale)
+            unsafe fn run(jobs: [Job; PAIRS], scale: f32, wide: bool) -> [i8; PAIRS] {
+                use std::arch::x86_64::{__m128i, __m256i};
+                if wide { bound::<__m256i>(jobs, scale) } else { bound::<__m128i>(jobs, scale) }
             }
-            return unsafe { run(jobs, self.scale) }.map(|b| b >= self.pass);
+            // SAFETY: new() checked for AVX2, and a job's rows have PAD columns either side
+            return unsafe { run(jobs, self.scale, self.wide) }.map(|b| b >= self.pass);
         }
         #[allow(unreachable_code)]
         [true; PAIRS]
@@ -387,24 +503,25 @@ impl Bound {
 const PAIRS: usize = 4; // scored side by side, as each pair's rows are one long dependency chain
 type Job<'a> = (&'a [i8], &'a [u8], i64); // a model's rows of Bound::prof, read, diagonal
 
-/// The band as lanes: lane l is column i + d - 8 + l at read position i, so last row's cell on the same
-/// diagonal is the same lane and the cell above is the next lane. Zero is -128, so saturation is the local
-/// score's floor. Gaps along the model are a prefix maximum, taken in doubling steps.
+/// The band as lanes, half of them either side: lane l is column i + d - half + l at read position i, so last
+/// row's cell on the same diagonal is the same lane and the cell above is the next lane. Zero is -128, so
+/// saturation is the local score's floor. Gaps along the model are a prefix maximum, taken in doubling steps.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-unsafe fn bound<V: Bytes16>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
+unsafe fn bound<V: Bytes>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
+    let half = V::LANES as i64 / 2;
     let neg = V::splat(i8::MIN);
     let ext = (GAP_EXTEND * scale) as i8;
     let open = V::splat((GAP_OPEN * scale) as i8);
     let (e1, e2, e4, e8) = (V::splat(ext), V::splat(2 * ext), V::splat(4 * ext), V::splat(8 * ext));
-    let mut last = [i8::MIN; 16];
-    last[15] = i8::MAX;
+    let mut last = [i8::MIN; 32];
+    last[V::LANES - 1] = i8::MAX;
     let last = V::load(last.as_ptr());
     let (mut h, mut del, mut best) = ([neg; PAIRS], [neg; PAIRS], [neg; PAIRS]);
     // each pair runs from the first read position whose band touches its model to the last
     let rows = jobs.map(|(prof, f, d)| {
         let cols = (prof.len() / 21 - 2 * PAD) as i64;
-        ((-d - BAND).max(0), (f.len() as i64).min(cols - d + BAND))
+        ((-d - half).max(0), (f.len() as i64).min(cols - d + half))
     });
     let steps = rows.iter().map(|&(from, to)| to - from).max().unwrap().max(0);
     for step in 0..steps {
@@ -413,22 +530,26 @@ unsafe fn bound<V: Bytes16>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
             let i = rows[p].0 + step;
             // a pair that is done reads padding, the first bytes of its profile
             let at = if i < rows[p].1 {
-                *f.get_unchecked(i as usize) as usize * (prof.len() / 21) + (PAD as i64 + i + d - BAND) as usize
+                *f.get_unchecked(i as usize) as usize * (prof.len() / 21) + (PAD as i64 + i + d - half) as usize
             } else {
                 0
             };
-            debug_assert!(at + 17 <= prof.len());
+            debug_assert!(at + V::LANES + 1 <= prof.len());
             let s = V::load(prof.as_ptr().add(at)).max(V::load(prof.as_ptr().add(at + 1)).min(last));
             // up one lane, except that the last keeps its own value too: it stands for two columns, and a
             // gap from the second to the first stays in it
             let up = h[p].subs(open).max(del[p].subs(e1));
-            del[p] = up.ext::<1>(up.ext::<15>(neg));
+            del[p] = up.lower(up.last_first());
             let m = h[p].adds(s).max(del[p]);
-            let mut x = neg.ext::<15>(m.subs(open));
-            x = x.max(neg.ext::<15>(x).subs(e1));
-            x = x.max(neg.ext::<14>(x).subs(e2));
-            x = x.max(neg.ext::<12>(x).subs(e4));
-            x = x.max(neg.ext::<8>(x).subs(e8));
+            let mut x = m.subs(open).raise::<1>(neg);
+            x = x.max(x.raise::<1>(neg).subs(e1));
+            x = x.max(x.raise::<2>(neg).subs(e2));
+            x = x.max(x.raise::<4>(neg).subs(e4));
+            x = x.max(x.raise::<8>(neg).subs(e8));
+            if V::LANES > 16 {
+                // in two, as 16 gap extensions don't fit in a byte
+                x = x.max(x.raise::<16>(neg).subs(e8).subs(e8));
+            }
             h[p] = m.max(x);
             best[p] = best[p].max(h[p]);
         }
@@ -1221,7 +1342,8 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     let gate = (gate_bits * 4.0).round() as i8;
     // a survivor is model << 48 | ORF << 17 | diagonal key, so it sorts as one integer
     assert!(pf.models() < 1 << 16 && block < 1 << 31);
-    // gapped score in a band of +-8 around the best diagonal (step 4); FILTER_BAND=b or =whole to change it
+    // gapped score in a band of +-8 around the best diagonal (step 4); FILTER_BAND=b or =whole to change it. Up to
+    // 16 has a SIMD bound ahead of it
     let band: Option<i64> = match std::env::var("FILTER_BAND").as_deref() { Ok("whole") => None, Ok(v) => Some(v.parse().unwrap()), Err(_) => Some(8) };
     // FILTER_DROP=n: skip the n k-mers with the longest lists in the index (promiscuous k-mers, from the
     // index alone)
@@ -1245,7 +1367,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     // at the diagonal bar but below the hand-off are not formatted and written (324 M rows at diagonal 17).
     // Half a printed digit lower, so a score that prints as g is kept and readers' cut on the text decides.
     let min_gapped: f32 = std::env::var("FILTER_MIN_GAPPED").map_or(f32::NEG_INFINITY, |v| v.parse::<f32>().unwrap() - 0.005);
-    let bound = if band == Some(BAND) { Bound::new(pf, min_gapped) } else { None };
+    let bound = band.and_then(|b| Bound::new(pf, min_gapped, b));
     let bounded = AtomicU64::new(0); // pairs the bound lets through to the f32 score
     let (engine, score4) = scorer4();
     let (hits, survivors, pairs_n) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
@@ -1515,21 +1637,23 @@ mod tests {
         }
         let pf = Pfam { lo, offs };
         let (mut kept, mut dropped) = (0, 0);
-        for min in [17.0f32, 21.25, 26.25] {
-            let Some(b) = Bound::new(&pf, min - 0.005) else { return }; // no SIMD here
+        // at 40 a gap of more than 16 columns can still pay, which the wide band's last step is for
+        for (min, band) in [17.0f32, 21.25, 26.25, 40.0].into_iter().flat_map(|min| [8i64, 16, 3, 12].map(|band| (min, band))) {
+            let Some(b) = Bound::new(&pf, min - 0.005, band) else { return }; // no SIMD here
             let (mut h, mut del) = (vec![], vec![]);
             for _ in 0..3000 {
                 let mut pairs: Vec<(usize, Vec<u8>, i64)> = vec![];
                 for _ in 0..PAIRS {
                     let m = (next() % 3) as usize;
                     let (mut f, mut c) = (vec![], (next() % lens[m] as u64) as usize);
-                    let d = c as i64 + [0, -8, 8, -7, 7, 9][(next() % 6) as usize] + (next() % 3) as i64 - 1;
+                    let d = c as i64 + [0, -band, band, 1 - band, band - 1, band + 1][(next() % 6) as usize] + (next() % 3) as i64 - 1;
                     while f.len() < 1 + (next() % 60) as usize {
                         match next() % 12 {
-                            0 => c += (next() % 4) as usize,
+                            0 => c += (next() % 4) as usize * if next() % 3 == 0 { band as usize / 2 } else { 1 },
                             // residues of the read in a gap
                             1 => {
-                                f.extend((0..=next() % 3).map(|_| (next() % 21) as u8));
+                                let n = next() % 3 * if next() % 3 == 0 { band as u64 / 2 } else { 1 };
+                                f.extend((0..=n).map(|_| (next() % 21) as u8));
                                 continue;
                             }
                             2 => f.push((next() % 21) as u8),
@@ -1537,12 +1661,20 @@ mod tests {
                         }
                         c += 1;
                     }
+                    if next() % 4 == 0 {
+                        // two clean stretches with one long gap in the model, from one edge of the band towards the other
+                        let (c, n) = ((next() % 60) as usize, 8 + (next() % 10) as usize);
+                        let gap = 1 + (next() % (2 * band as u64)) as usize;
+                        let two = (c..c + n).chain(c + n + gap..c + 2 * n + gap);
+                        pairs.push((2, two.map(|c| top[2].get(c).copied().unwrap_or(20)).collect(), c as i64 + band - (next() % 2) as i64));
+                        continue;
+                    }
                     pairs.push((m, f, d));
                 }
                 let reach = b.may_reach(std::array::from_fn(|i| (pairs[i].0, &pairs[i].1[..], pairs[i].2)));
                 for ((m, f, d), reach) in pairs.iter().zip(reach) {
-                    let g = gapped_band(&pf.lo, pf.offs[*m] as usize, lens[*m], f, *d, BAND, &mut h, &mut del);
-                    assert!(reach || g < min - 0.005, "dropped {g} at {min}");
+                    let g = gapped_band(&pf.lo, pf.offs[*m] as usize, lens[*m], f, *d, band, &mut h, &mut del);
+                    assert!(reach || g < min - 0.005, "dropped {g} at {min}, band {band}");
                     (kept, dropped) = (kept + (g >= min) as usize, dropped + !reach as usize);
                 }
             }
