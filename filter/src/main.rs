@@ -888,14 +888,132 @@ fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LAN
     }
 }
 
+/// `pshufb` indexes only 16 bytes, so a 32-entry table lookup takes two shuffles and a blend
+/// where NEON's `vqtbl2q_s8` takes one. That is the only part of the kernel that differs by
+/// architecture: the structure around it -- four jobs in one pass over the window, each table
+/// loaded once, independent accumulator chains, masks in SIMD -- is what makes it fast, and is
+/// the same everywhere.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn nibbles_sse(best: std::arch::x86_64::__m128i, gate: std::arch::x86_64::__m128i) -> u64 {
+    use std::arch::x86_64::*;
+    // best >= gate, without cmpgt's wrap at i8::MIN: 0xFF per passing lane
+    let pass = _mm_cmpeq_epi8(_mm_max_epi8(best, gate), best);
+    // bytes of 0xFF/0x00 to one nibble per lane, as NEON's shift-and-narrow does: a u16 pair
+    // 0xFF00 >> 4 keeps 0xF0 in its low byte, 0x00FF >> 4 keeps 0x0F
+    let sh = _mm_srli_epi16::<4>(pass);
+    let low = _mm_shuffle_epi8(sh, _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+    _mm_cvtsi128_si64(low) as u64
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn score4_sse41_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    use std::arch::x86_64::*;
+    for i in 0..4 {
+        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+    }
+    let zero = _mm_setzero_si128();
+    let fifteen = _mm_set1_epi8(15);
+    let (mut cur, mut best) = ([zero; 4], [zero; 4]);
+    let p = [0, 1, 2, 3].map(|i| prof.as_ptr().add(rows[i] * STRIDE));
+    for o in span.0..span.1 {
+        for i in 0..4 {
+            let col = p[i].add(o * STRIDE) as *const __m128i;
+            let idx = _mm_loadu_si128(w[i].as_ptr().add(o * LANES) as *const __m128i);
+            let from_lo = _mm_shuffle_epi8(_mm_loadu_si128(col), idx);
+            let from_hi = _mm_shuffle_epi8(_mm_loadu_si128(col.add(1)), idx);
+            let s = _mm_blendv_epi8(from_lo, from_hi, _mm_cmpgt_epi8(idx, fifteen));
+            cur[i] = _mm_max_epi8(_mm_adds_epi8(cur[i], s), zero);
+            best[i] = _mm_max_epi8(best[i], cur[i]);
+        }
+    }
+    let (g0, g1) = (_mm_set1_epi8(gates.0), _mm_set1_epi8(gates.1));
+    for i in 0..4 {
+        _mm_storeu_si128(out[i].as_mut_ptr() as *mut __m128i, best[i]);
+        masks[i] = (nibbles_sse(best[i], g0), nibbles_sse(best[i], g1));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn score4_sse41(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    unsafe { score4_sse41_inner(prof, rows, w, out, span, gates, masks) }
+}
+
+/// AVX2: two jobs per 256-bit register, since `vpshufb` shuffles each 128-bit half with its own
+/// table. Same instruction count per job as SSE for the lookup, half as many instructions issued,
+/// so about 1.5x -- the limit is `pshufb`'s 16-byte window, not register width. Going wider would
+/// mean 32 lanes, which is a change to the postings layout in `postings`, not to this kernel.
+/// ponytail: two accumulator chains here against NEON's four; if this turns out latency-bound,
+/// the fix is an eight-job batch in `join`, not a different kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn score4_avx2_inner(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    use std::arch::x86_64::*;
+    for i in 0..4 {
+        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+    }
+    let zero = _mm256_setzero_si256();
+    let fifteen = _mm256_set1_epi8(15);
+    let (mut cur, mut best) = ([zero; 2], [zero; 2]);
+    let p = [0, 1, 2, 3].map(|i| prof.as_ptr().add(rows[i] * STRIDE));
+    // pair j holds jobs 2j and 2j+1, in the low and high half
+    // the two halves of a 256-bit register are shuffled independently, so one register holds two
+    // jobs' 16-entry tables, or two jobs' 16 window indices
+    let pack = |a: *const __m128i, b: *const __m128i| -> __m256i {
+        _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(a)), _mm_loadu_si128(b))
+    };
+    for o in span.0..span.1 {
+        for j in 0..2 {
+            let (col_i, col_j) = (p[2 * j].add(o * STRIDE), p[2 * j + 1].add(o * STRIDE));
+            let table_lo = pack(col_i as *const __m128i, col_j as *const __m128i);
+            let table_hi = pack(col_i.add(16) as *const __m128i, col_j.add(16) as *const __m128i);
+            let idx = pack(
+                w[2 * j].as_ptr().add(o * LANES) as *const __m128i,
+                w[2 * j + 1].as_ptr().add(o * LANES) as *const __m128i,
+            );
+            let from_lo = _mm256_shuffle_epi8(table_lo, idx);
+            let from_hi = _mm256_shuffle_epi8(table_hi, idx);
+            let s = _mm256_blendv_epi8(from_lo, from_hi, _mm256_cmpgt_epi8(idx, fifteen));
+            cur[j] = _mm256_max_epi8(_mm256_adds_epi8(cur[j], s), zero);
+            best[j] = _mm256_max_epi8(best[j], cur[j]);
+        }
+    }
+    let (g0, g1) = (_mm_set1_epi8(gates.0), _mm_set1_epi8(gates.1));
+    for j in 0..2 {
+        let halves = [_mm256_castsi256_si128(best[j]), _mm256_extracti128_si256::<1>(best[j])];
+        for (h, half) in halves.iter().enumerate() {
+            let i = 2 * j + h;
+            _mm_storeu_si128(out[i].as_mut_ptr() as *mut __m128i, *half);
+            masks[i] = (nibbles_sse(*half, g0), nibbles_sse(*half, g1));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn score4_avx2(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LANES]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
+    unsafe { score4_avx2_inner(prof, rows, w, out, span, gates, masks) }
+}
+
 fn scorer4() -> Scorer4 {
     // FILTER_SIMD=generic keeps this CPU's per-group kernel but drops the fused four-job one, which
-    // is what x86 gets today (there is no score4_sse41), so the loss is measurable on any machine.
-    if matches!(std::env::var("FILTER_SIMD").as_deref(), Ok("scalar") | Ok("generic")) {
+    // is what x86 had before score4_sse41 and score4_avx2, so that loss stays measurable anywhere.
+    let forced = std::env::var("FILTER_SIMD").unwrap_or_default();
+    if matches!(forced.as_str(), "scalar" | "generic") {
         return score4_generic;
     }
     #[cfg(target_arch = "aarch64")]
     return score4_neon;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // FILTER_SIMD=sse4.1 forces the narrower kernel on a machine that has AVX2, to measure it
+        if is_x86_feature_detected!("avx2") && forced != "sse4.1" {
+            return score4_avx2;
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            return score4_sse41;
+        }
+    }
     #[allow(unreachable_code)]
     score4_generic
 }
@@ -1204,14 +1322,28 @@ mod tests {
         for _ in 0..100 {
             let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..WIN * LANES).map(|_| (next() % 21) as u8).collect()).collect();
             let rows = [0, 1, 2, 3].map(|_| (next() % (2 * WIN as u64)) as usize);
-            let mut a = [[0i8; LANES]; 4];
-            let mut masks: Masks = [(0, 0); 4];
-            scorer4()(&prof, rows, [&ws[0][..], &ws[1][..], &ws[2][..], &ws[3][..]], &mut a, (3, WIN - 2), (10, 40), &mut masks);
-            for i in 0..4 {
-                let mut b = [0i8; LANES];
-                score_scalar(&prof, rows[i], &ws[i], &mut b, (3, WIN - 2));
-                assert_eq!(a[i], b);
-                assert_eq!(masks[i], (nibbles(&b, 10), nibbles(&b, 40)));
+            // every kernel this CPU has, not just the one scorer4() dispatches to, so the x86
+            // pair is both checked wherever the tests run on x86
+            let mut kernels: Vec<(&str, Scorer4)> = vec![("generic", score4_generic), ("dispatched", scorer4())];
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("sse4.1") {
+                    kernels.push(("sse4.1", score4_sse41));
+                }
+                if is_x86_feature_detected!("avx2") {
+                    kernels.push(("avx2", score4_avx2));
+                }
+            }
+            for (name, k) in kernels {
+                let mut a = [[0i8; LANES]; 4];
+                let mut masks: Masks = [(0, 0); 4];
+                k(&prof, rows, [&ws[0][..], &ws[1][..], &ws[2][..], &ws[3][..]], &mut a, (3, WIN - 2), (10, 40), &mut masks);
+                for i in 0..4 {
+                    let mut b = [0i8; LANES];
+                    score_scalar(&prof, rows[i], &ws[i], &mut b, (3, WIN - 2));
+                    assert_eq!(a[i], b, "{name} job {i}");
+                    assert_eq!(masks[i], (nibbles(&b, 10), nibbles(&b, 40)), "{name} masks {i}");
+                }
             }
         }
     }

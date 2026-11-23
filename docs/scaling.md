@@ -71,12 +71,62 @@ same instruction count per lane; on AVX-512 VBMI, `_mm512_permutexvar_epi8` is a
 lookup in one instruction — NEON's `tbl2` but four times wider — which would put x86 ahead of this
 laptop rather than behind it.
 
+## One kernel design, three lookups (2026-11-23)
+
+`score4_sse41` and `score4_avx2` are now written. They are **not** two different designs, and
+should not become two: everything that makes `score4_neon` fast is architecture-independent and
+they share it —
+
+- all four jobs in one pass over the window, so each offset's loop overhead is paid once;
+- each job's profile column loaded once per offset;
+- independent accumulator chains, so the `adds`-then-`max` latency is hidden;
+- lane masks computed in SIMD (`nibbles_sse` reproduces NEON's shift-and-narrow: compare, shift
+  each u16 right by 4, `pshufb` the low bytes together, one `movq`).
+
+The only part that differs is the one the hardware forces: **a 32-entry byte lookup for 16
+lanes**. NEON does it in one `vqtbl2q_s8`. `pshufb` indexes only 16 bytes, so x86 needs two
+shuffles, a compare and a blend. AVX2 doesn't remove that — `vpshufb` still indexes 16 bytes per
+128-bit half — but it lets one register carry two jobs, each half with its own table, so the same
+work issues half as many instructions. That is roughly 1.5×, not 2×; the limit is `pshufb`'s
+16-byte window, not register width.
+
+So what is good on x86 is good on ARM, and vice versa: the structure is the speed. The lookup is
+three lines per architecture. Going genuinely wider — 32 lanes on AVX2, 64 on AVX-512 VBMI with
+`vpermb`, a true 64-entry lookup in one instruction — means widening `LANES` in the postings
+layout, which is shared by every kernel. That is the next step if x86 measurements say the
+kernel, rather than memory, is still the limit.
+
+### Verified
+
+Homebrew's Rust here has only the aarch64 standard library, so the x86 code was checked in
+`rust:1-slim-trixie` under `--platform linux/amd64`, which reports SSE4.1 and AVX2:
+
+- **It compiles on x86_64** — which it would not have before: the first draft had a `*const i8`
+  passed where `*const u8` was expected, invisible on ARM because the code was `cfg`'d out.
+- **`score4_equals_scalar` now checks every kernel the CPU has**, not only the one `scorer4()`
+  dispatches to, so SSE4.1 and AVX2 are both tested against scalar wherever the suite runs on x86.
+  All four (generic, dispatched, sse4.1, avx2) pass.
+- **End to end, byte-identical:** 20,000 real ORFs against `k4T8`, the x86 AVX2, SSE4.1 and
+  generic kernels each write the same 26,319 pairs as ARM's NEON, `cmp` clean.
+
+Under emulation the fused kernels ran at 13–15 ns per hit against generic's 39, about 3×. That is
+direction, not magnitude: emulation translates x86 into ARM, and in particular says nothing about
+AVX2 against SSE4.1 (they came out level). **The speed-up has to be measured on Codon.**
+
+`FILTER_SIMD=sse4.1` forces the narrower kernel on an AVX2 machine and `FILTER_SIMD=generic` the
+old path, so one binary measures all three:
+
+```bash
+for m in "" sse4.1 generic; do FILTER_SIMD=$m measure/speed.sh x86_${m:-avx2} 16 join data/index/k4T6.5.tidx 22 16.5 400000; done
+```
+
 ## Ranked plan
 
 | # | Change | Expected | Recall cost | Effort |
 |---|---|---|---|---|
-| 1 | `score4_sse41`, fused like `score4_neon` | most of 8× on x86 | **none** | a day; `score4_equals_scalar` already tests it |
-| 2 | AVX2 (32 lanes) and an AVX-512 VBMI path | 2–4× beyond #1 | **none** | days; runtime feature detection already present |
+| 1 | `score4_sse41`, fused like `score4_neon` | most of 8× on x86 | **none** | **done**, verified; measure on Codon |
+| 2a | AVX2, two jobs per register | ~1.5× beyond #1 | **none** | **done**, verified; measure on Codon |
+| 2b | 32 / 64 lanes (AVX2, AVX-512 VBMI) | up to 2–4× beyond #2a | **none** | widens `LANES` in `postings`; only if #1–2a leave the kernel as the limit |
 | 3 | GA-only settings for RawR: bar 22, min_gapped ~24, not bar 17 | 1.5× | .999 → .995 ≥GA | config only |
 | 4 | T7.5 for RawR instead of T6.5 | 2.3× | .995 → .984 ≥GA | config only |
 | 5 | Per-model T as a length rule | 1.2× | none at equal hits | implemented (`FILTER_T_FILE`), needs the rule |
