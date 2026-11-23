@@ -469,8 +469,10 @@ impl Bytes for std::arch::x86_64::__m256i {
 
 /// An upper bound on gapped_band's score, in bytes, one read residue per step with the band in one
 /// register, so a pair that cannot reach `min` is dropped without the f32 matrix. Scores are rounded up,
-/// gap costs down and the band's odd last column is merged into the one before it, so it never drops a pair
-/// gapped_band would keep. The band is 8 or 16 columns either way, the narrower that holds the one
+/// gap costs down, and a band of 8 or 16, a column wider than the register, has its last two columns merged, so it
+/// never drops a pair gapped_band would keep. Merged columns score each the other's residues, so that on a whole
+/// protein the last lane climbs by chance: a band of 7 or 15 has none, and its bound drops three to seven times as
+/// many pairs there. The band is 8 or 16 columns either way, the narrower that holds the one
 /// asked for: a wider band only raises a score.
 struct Bound {
     prof: Vec<i8>, // per model, 21 residues x (PAD + columns + PAD), residue-major
@@ -478,6 +480,7 @@ struct Bound {
     scale: f32,
     pass: Vec<i8>, // per model, the lowest bound that may reach its min, offset by -128
     wide: bool, // a band of 16, not 8
+    merge: bool, // the band has a column more than there are lanes, and the last lane stands for two
 }
 const PAD: usize = 40; // columns either side of a model: the band may hang off both ends
 impl Bound {
@@ -516,7 +519,7 @@ impl Bound {
             }
         });
         let pass = mins.iter().map(|min| ((min * scale - 0.01).floor() - 128.0) as i8).collect();
-        Some(Bound { prof, at, scale, pass, wide: band > 8 })
+        Some(Bound { prof, at, scale, pass, wide: band > 8, merge: band == 8 || band == 16 })
     }
     /// Whether each pair (model, read, diagonal as column - read position) may reach min.
     fn may_reach(&self, pairs: [(usize, &[u8], i64); PAIRS]) -> [bool; PAIRS] {
@@ -525,19 +528,19 @@ impl Bound {
         {
             use std::arch::aarch64::int8x16_t;
             // SAFETY: NEON is part of aarch64, and a job's rows have PAD columns either side
-            let best = unsafe { if self.wide { bound::<Two<int8x16_t>>(jobs, self.scale) } else { bound::<int8x16_t>(jobs, self.scale) } };
+            let best = unsafe { if self.wide { bound::<Two<int8x16_t>>(jobs, self.scale, self.merge) } else { bound::<int8x16_t>(jobs, self.scale, self.merge) } };
             return std::array::from_fn(|i| best[i] >= self.pass[pairs[i].0]);
         }
         #[cfg(target_arch = "x86_64")]
         {
             // AVX2 for the wide band's registers, and for its three-operand encoding in the narrow one
             #[target_feature(enable = "avx2")]
-            unsafe fn run(jobs: [Job; PAIRS], scale: f32, wide: bool) -> [i8; PAIRS] {
+            unsafe fn run(jobs: [Job; PAIRS], scale: f32, wide: bool, merge: bool) -> [i8; PAIRS] {
                 use std::arch::x86_64::{__m128i, __m256i};
-                if wide { bound::<__m256i>(jobs, scale) } else { bound::<__m128i>(jobs, scale) }
+                if wide { bound::<__m256i>(jobs, scale, merge) } else { bound::<__m128i>(jobs, scale, merge) }
             }
             // SAFETY: new() checked for AVX2, and a job's rows have PAD columns either side
-            let best = unsafe { run(jobs, self.scale, self.wide) };
+            let best = unsafe { run(jobs, self.scale, self.wide, self.merge) };
             return std::array::from_fn(|i| best[i] >= self.pass[pairs[i].0]);
         }
         #[allow(unreachable_code)]
@@ -552,14 +555,16 @@ type Job<'a> = (&'a [i8], &'a [u8], i64); // a model's rows of Bound::prof, read
 /// saturation is the local score's floor. Gaps along the model are a prefix maximum, taken in doubling steps.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-unsafe fn bound<V: Bytes>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
+unsafe fn bound<V: Bytes>(jobs: [Job; PAIRS], scale: f32, merge: bool) -> [i8; PAIRS] {
     let half = V::LANES as i64 / 2;
     let neg = V::splat(i8::MIN);
     let ext = (GAP_EXTEND * scale) as i8;
     let open = V::splat((GAP_OPEN * scale) as i8);
     let (e1, e2, e4, e8) = (V::splat(ext), V::splat(2 * ext), V::splat(4 * ext), V::splat(8 * ext));
     let mut last = [i8::MIN; 32];
-    last[V::LANES - 1] = i8::MAX;
+    if merge {
+        last[V::LANES - 1] = i8::MAX;
+    }
     let last = V::load(last.as_ptr());
     let (mut h, mut del, mut best) = ([neg; PAIRS], [neg; PAIRS], [neg; PAIRS]);
     // each pair runs from the first read position whose band touches its model to the last
@@ -583,7 +588,7 @@ unsafe fn bound<V: Bytes>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
             // up one lane, except that the last keeps its own value too: it stands for two columns, and a
             // gap from the second to the first stays in it
             let up = h[p].subs(open).max(del[p].subs(e1));
-            del[p] = up.lower(up.last_first());
+            del[p] = up.lower(if merge { up.last_first() } else { neg });
             let m = h[p].adds(s).max(del[p]);
             let mut x = m.subs(open).raise::<1>(neg);
             x = x.max(x.raise::<1>(neg).subs(e1));
@@ -1411,8 +1416,10 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
             dropped[c] = true;
         }
     }
-    // FILTER_DIAGONALS=all: score a pair in a band around every diagonal at the bar, not only its best one
-    let all_diagonals = std::env::var("FILTER_DIAGONALS").as_deref() == Ok("all");
+    // FILTER_DIAGONALS=all: score a pair in a band around every diagonal at the bar, not only its best one. any: the same
+    // pairs, but a pair is done at the first diagonal that reaches its bar, so the scores it is written with are that one's
+    let diagonals = std::env::var("FILTER_DIAGONALS").unwrap_or_default();
+    let (all_diagonals, first_only) = (matches!(&diagonals[..], "all" | "any"), diagonals == "any");
     let covered_gate = (((bar - SLACK) * 4.0).floor().min(127.0) as i8).max(gate);
     // FILTER_MIN_GAPPED=g: write only pairs whose gapped score is at least g (HMMER's bar), so pairs scored
     // at the diagonal bar but below the hand-off are not formatted and written (324 M rows at diagonal 17).
@@ -1591,6 +1598,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         }))
                     });
                     for (&(o, m, d, diag), _) in four.iter().zip(reach).filter(|(_, r)| *r) {
+                        if first_only && pending.is_some_and(|p| p.0 == o && p.1 == m) {
+                            continue;
+                        }
                         let f = chunk[o as usize];
                         n += 1;
                         let a = pf.offs[m as usize] as usize;
@@ -1984,7 +1994,7 @@ mod tests {
         let pf = Pfam { lo, offs };
         let (mut kept, mut dropped) = (0, 0);
         // at 40 a gap of more than 16 columns can still pay, which the wide band's last step is for
-        for (min, band) in [17.0f32, 21.25, 26.25, 40.0].into_iter().flat_map(|min| [8i64, 16, 3, 12].map(|band| (min, band))) {
+        for (min, band) in [17.0f32, 21.25, 26.25, 40.0].into_iter().flat_map(|min| [8i64, 16, 3, 12, 7, 15].map(|band| (min, band))) {
             // one model with a lower bar than the others, below what one bar for all may be
             let mins = [min - 0.005, min - 0.005, 13.0 - 0.005];
             let Some(b) = Bound::new(&pf, &mins, band) else { return }; // no SIMD here

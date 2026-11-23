@@ -341,3 +341,11 @@ on. The filter now does too, when it loads the profile, so an old prep needs no 
 **`FILTER_GAPPED_FILE`**: a gapped bar per model, one per line, where that is lower than `FILTER_MIN_GAPPED`. A short repeat reaches GA1 as
 several copies, each under any bar that suits the rest. The bars are the raw score of a domain at GA2 less 4 bits; on V3's ORFs they add 6% to candidates at
 bar 15 and 10-12% at 17 and 20, and nothing to the filter's time.
+
+**A band of 7 or 15 has a tighter bound.** Bands of 8 and 16 are a column wider than the register, so the bound merges the last two columns, and
+on whole proteins that lane climbs by chance: the bound passed 45% of pairs at bar 20 (band 8) where 6% pass at 7, and 48% against 18% at 16 and 15 (3,013
+Pfam models, 50,000 reversed MGnify proteins of 165 residues). On V3's ORFs it matters less: bar 15 at 15 and `any` takes 90 CPU-s against 95, with the same
+8,533 of 8,533 pairs; bar 17 at 7 takes 63 against 63. The bound for 8 and 16 is as it was.
+
+**`FILTER_DIAGONALS=any`** writes the pairs `all` does, and leaves a pair at the first diagonal that reaches its bar: 188,485 scored in full against 336,092 on
+proteins that hold many true pairs. Its scores are that diagonal's, not the pair's best.
