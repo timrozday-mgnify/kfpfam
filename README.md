@@ -40,7 +40,13 @@ measure/speed.sh NAME 4 join data/index/k4T7.tidx 22 14.5 500000  # timed and sc
 ```
 
 Two settings against nail on the same machine, from the plan's Progress log (1.07 M reads; recall on 50,000;
-Mode A re-tuned 2026-11-11 after HMMER moved to worker processes, Mode B's HMMER cost is from before):
+Mode A re-tuned 2026-11-11 after HMMER moved to worker processes, Mode B's HMMER cost is from before).
+
+**These numbers do not transfer.** On eleven real libraries through the RawR pipeline, Mode A cost about
+13x the per-read figure below and Mode B 12x, against 1.7x for nail, and 183 families came back empty.
+The cost gap is per-core throughput on x86 (threads scale at 96%), and the recall figure is measured on a
+truth set covering 6.6% of Pfam. See [benchmark representativeness](docs/benchmark-representativeness.md)
+before quoting either column.
 
 | Mode | Index | Diagonal bar, gate | HMMER on gapped ≥ | core-ms per read | Recall ≥GA; −5–GA, −10–−5, −20–−10 |
 | --- | --- | --- | --- | --- | --- |
