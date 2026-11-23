@@ -32,6 +32,7 @@ impl Pfam {
         fs::File::open(&path).unwrap().read_exact(bytes_of_mut(&mut lo)).unwrap();
         let b = fs::read(format!("{dir}/offs.u32")).unwrap();
         let offs = b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        lo.par_chunks_mut(21).for_each(score_unknown);
         Pfam { lo, offs }
     }
     fn models(&self) -> usize {
@@ -39,32 +40,70 @@ impl Pfam {
     }
 }
 
-/// Calls `visit` with each k-mer scoring >= t in the k columns from `at`, and its score.
+/// Scores an unknown residue, X, in one column as HMMER does: the column's mean score over the background. prep.py
+/// writes -100, which ended every alignment at an X that HMMER carries on through.
+fn score_unknown(column: &mut [f32]) {
+    let mean = (0..20).map(|r| Q[r] * column[r] as f64).sum::<f64>() / Q.iter().sum::<f64>();
+    column[20] = mean as f32;
+}
+
+/// Which residues of a stretch make up the word an index holds: bit i for residue i. Contiguous for a k-mer;
+/// a spaced word leaves residues out between its first and last, which are both in it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Shape(u64);
+impl Shape {
+    /// "4" for a 4-mer, "1011001" for a spaced word.
+    fn parse(s: &str) -> Shape {
+        if s.len() == 1 {
+            let k: u32 = s.parse().expect("k, or a shape of 0s and 1s");
+            return Shape((1 << k) - 1);
+        }
+        assert!(s.len() <= 16 && s.starts_with('1') && s.ends_with('1') && s.bytes().all(|b| b == b'0' || b == b'1'), "{s}: a shape is 0s and 1s, from a 1 to a 1");
+        Shape(s.bytes().enumerate().map(|(i, b)| ((b == b'1') as u64) << i).sum())
+    }
+    /// Residues in the word.
+    fn k(self) -> usize { self.0.count_ones() as usize }
+    /// Residues from its first to its last.
+    fn span(self) -> usize { 64 - self.0.leading_zeros() as usize }
+    fn offsets(self) -> Vec<usize> { (0..self.span()).filter(|i| self.0 >> i & 1 == 1).collect() }
+    fn contiguous(self) -> bool { self.k() == self.span() }
+    /// In an index's header: k for a k-mer, as indexes have always had, or the mask above any k.
+    fn header(self) -> u64 { if self.contiguous() { self.k() as u64 } else { self.0 << 8 } }
+    fn from_header(h: u64) -> Shape { if h < 256 { Shape((1 << h) - 1) } else { Shape(h >> 8) } }
+    /// k, for the steps that read k-mers only.
+    fn kmer(self) -> usize {
+        assert!(self.contiguous(), "a spaced index is for tile and join only");
+        self.k()
+    }
+}
+
+/// Calls `visit` with each word scoring >= t in the columns `cols` of the profile, and its score.
 /// `keep(i, prefix)` can drop a prefix of length i, and everything under it.
-fn enumerate(lo: &[f32], at: usize, k: usize, t: f32, keep: &impl Fn(usize, usize) -> bool, visit: &mut impl FnMut(usize, f32)) {
+fn enumerate(lo: &[f32], cols: &[usize], t: f32, keep: &impl Fn(usize, usize) -> bool, visit: &mut impl FnMut(usize, f32)) {
     let mut rest = [0.0f32; 16];
-    for i in (0..k).rev() {
-        let top = (0..20).map(|r| lo[(at + i) * 21 + r]).fold(f32::MIN, f32::max);
+    for i in (0..cols.len()).rev() {
+        let top = (0..20).map(|r| lo[cols[i] * 21 + r]).fold(f32::MIN, f32::max);
         rest[i] = rest[i + 1] + top;
     }
     #[allow(clippy::too_many_arguments)]
-    fn go(lo: &[f32], at: usize, i: usize, k: usize, code: usize, sum: f32, t: f32, rest: &[f32], keep: &impl Fn(usize, usize) -> bool, visit: &mut impl FnMut(usize, f32)) {
-        if i == k {
+    fn go(lo: &[f32], cols: &[usize], i: usize, code: usize, sum: f32, t: f32, rest: &[f32], keep: &impl Fn(usize, usize) -> bool, visit: &mut impl FnMut(usize, f32)) {
+        if i == cols.len() {
             visit(code, sum);
             return;
         }
         for r in 0..20 {
-            let s = sum + lo[(at + i) * 21 + r];
+            let s = sum + lo[cols[i] * 21 + r];
             let next = code * 20 + r;
             if s + rest[i + 1] >= t && keep(i + 1, next) {
-                go(lo, at, i + 1, k, next, s, t, rest, keep, visit);
+                go(lo, cols, i + 1, next, s, t, rest, keep, visit);
             }
         }
     }
-    go(lo, at, 0, k, 0, 0.0, t, &rest, keep, visit);
+    go(lo, cols, 0, 0, 0.0, t, &rest, keep, visit);
 }
 
-fn build(pf: &Pfam, k: usize, t_all: f32, out: &str) {
+fn build(pf: &Pfam, shape: Shape, t_all: f32, out: &str) {
+    let (k, span, offsets) = (shape.k(), shape.span(), shape.offsets());
     // FILTER_T_FILE: one T per model, one per line, in place of the global T
     let per_model: Vec<f32> = match std::env::var("FILTER_T_FILE") {
         Ok(p) => fs::read_to_string(p).unwrap().lines().map(|l| l.trim().parse().unwrap()).collect(),
@@ -76,12 +115,13 @@ fn build(pf: &Pfam, k: usize, t_all: f32, out: &str) {
     let mut starts = vec![0u64; space + 1];
     let windows = |m: usize| {
         let (a, b) = (pf.offs[m] as usize, pf.offs[m + 1] as usize);
-        (a, if b - a >= k { b - a - k + 1 } else { 0 })
+        (a, if b - a >= span { b - a - span + 1 } else { 0 })
     };
+    let at = |c: usize| offsets.iter().map(|o| c + o).collect::<Vec<_>>();
     for m in 0..pf.models() {
         let (a, n) = windows(m);
         for c in 0..n {
-            enumerate(&pf.lo, a + c, k, per_model[m], &|_, _| true, &mut |code, _| starts[code + 1] += 1);
+            enumerate(&pf.lo, &at(a + c), per_model[m], &|_, _| true, &mut |code, _| starts[code + 1] += 1);
         }
     }
     for i in 0..space {
@@ -95,14 +135,14 @@ fn build(pf: &Pfam, k: usize, t_all: f32, out: &str) {
         let (a, n) = windows(m);
         for c in 0..n {
             assert!(m < 65536 && c < 65536);
-            enumerate(&pf.lo, a + c, k, per_model[m], &|_, _| true, &mut |code, _| {
+            enumerate(&pf.lo, &at(a + c), per_model[m], &|_, _| true, &mut |code, _| {
                 entries[cursor[code] as usize] = (m as u32) << 16 | c as u32;
                 cursor[code] += 1;
             });
         }
     }
     let mut f = std::io::BufWriter::new(fs::File::create(out).unwrap());
-    f.write_all(&(k as u64).to_le_bytes()).unwrap();
+    f.write_all(&shape.header().to_le_bytes()).unwrap();
     f.write_all(&(total as u64).to_le_bytes()).unwrap();
     f.write_all(bytes_of(&starts)).unwrap();
     f.write_all(bytes_of(&entries)).unwrap();
@@ -118,7 +158,7 @@ fn bytes_of_mut<T>(v: &mut [T]) -> &mut [u8] {
 }
 
 struct Index {
-    k: usize,
+    shape: Shape,
     starts: Vec<u64>,
     entries: Vec<u32>,
 }
@@ -126,12 +166,12 @@ fn load_index(path: &str) -> Index {
     let mut f = fs::File::open(path).unwrap();
     let mut h = [0u64; 2];
     f.read_exact(bytes_of_mut(&mut h)).unwrap();
-    let k = h[0] as usize;
-    let mut starts = vec![0u64; 20usize.pow(k as u32) + 1];
+    let shape = Shape::from_header(h[0]);
+    let mut starts = vec![0u64; 20usize.pow(shape.k() as u32) + 1];
     f.read_exact(bytes_of_mut(&mut starts)).unwrap();
     let mut entries = vec![0u32; h[1] as usize];
     f.read_exact(bytes_of_mut(&mut entries)).unwrap();
-    Index { k, starts, entries }
+    Index { shape, starts, entries }
 }
 
 fn read_orfs(path: &str) -> Vec<(String, Vec<u8>)> {
@@ -436,13 +476,15 @@ struct Bound {
     prof: Vec<i8>, // per model, 21 residues x (PAD + columns + PAD), residue-major
     at: Vec<usize>,
     scale: f32,
-    pass: i8, // the lowest bound that may reach min, offset by -128
+    pass: Vec<i8>, // per model, the lowest bound that may reach its min, offset by -128
     wide: bool, // a band of 16, not 8
 }
 const PAD: usize = 40; // columns either side of a model: the band may hang off both ends
 impl Bound {
-    /// None when there is nothing to bound (no min), or no SIMD for it or for a band this wide here.
-    fn new(pf: &Pfam, min: f32, band: i64) -> Option<Bound> {
+    /// None when there is nothing to bound (no min), or no SIMD for it or for a band this wide here. `mins` has one
+    /// per model, and the highest sets the scale, so every one of them fits in a byte.
+    fn new(pf: &Pfam, mins: &[f32], band: i64) -> Option<Bound> {
+        let min = mins.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         if !(16.0..=250.0).contains(&min) || !(0..=16).contains(&band) || std::env::var("FILTER_SIMD").as_deref() == Ok("scalar") {
             return None;
         }
@@ -473,7 +515,8 @@ impl Bound {
                 }
             }
         });
-        Some(Bound { prof, at, scale, pass: ((min * scale - 0.01).floor() - 128.0) as i8, wide: band > 8 })
+        let pass = mins.iter().map(|min| ((min * scale - 0.01).floor() - 128.0) as i8).collect();
+        Some(Bound { prof, at, scale, pass, wide: band > 8 })
     }
     /// Whether each pair (model, read, diagonal as column - read position) may reach min.
     fn may_reach(&self, pairs: [(usize, &[u8], i64); PAIRS]) -> [bool; PAIRS] {
@@ -483,7 +526,7 @@ impl Bound {
             use std::arch::aarch64::int8x16_t;
             // SAFETY: NEON is part of aarch64, and a job's rows have PAD columns either side
             let best = unsafe { if self.wide { bound::<Two<int8x16_t>>(jobs, self.scale) } else { bound::<int8x16_t>(jobs, self.scale) } };
-            return best.map(|b| b >= self.pass);
+            return std::array::from_fn(|i| best[i] >= self.pass[pairs[i].0]);
         }
         #[cfg(target_arch = "x86_64")]
         {
@@ -494,7 +537,8 @@ impl Bound {
                 if wide { bound::<__m256i>(jobs, scale) } else { bound::<__m128i>(jobs, scale) }
             }
             // SAFETY: new() checked for AVX2, and a job's rows have PAD columns either side
-            return unsafe { run(jobs, self.scale, self.wide) }.map(|b| b >= self.pass);
+            let best = unsafe { run(jobs, self.scale, self.wide) };
+            return std::array::from_fn(|i| best[i] >= self.pass[pairs[i].0]);
         }
         #[allow(unreachable_code)]
         [true; PAIRS]
@@ -558,7 +602,7 @@ unsafe fn bound<V: Bytes>(jobs: [Job; PAIRS], scale: f32) -> [i8; PAIRS] {
 }
 
 fn search(pf: &Pfam, idx: &Index, path: &str, bar: f32, out: &str, seeds: Option<&String>) {
-    let orfs = read_orfs(path);
+    let (orfs, k) = (read_orfs(path), idx.shape.kmer());
     let (hits, passed, align_ns) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let t0 = Instant::now();
     let chunks: Vec<(String, String)> = orfs
@@ -568,13 +612,13 @@ fn search(pf: &Pfam, idx: &Index, path: &str, bar: f32, out: &str, seeds: Option
             let (mut n_hits, mut n_passed, mut ns) = (0u64, 0u64, 0u64);
             for (name, f) in chunk {
                 found.clear();
-                if f.len() < idx.k {
+                if f.len() < k {
                     continue;
                 }
-                for j in 0..=(f.len() - idx.k) {
+                for j in 0..=(f.len() - k) {
                     let mut code = 0usize;
                     let mut ok = true;
-                    for &c in &f[j..j + idx.k] {
+                    for &c in &f[j..j + k] {
                         ok &= c < 20;
                         code = code * 20 + c as usize;
                     }
@@ -725,7 +769,7 @@ fn sketch(pf: &Pfam, path: &str, k: usize, t: f32, scaled: u64, reverse: bool, o
             let mut chain = vec![0.0f32; n + 1]; // best sum over non-overlapping windows
             for c in 0..n {
                 let mut top = f32::MIN;
-                enumerate(&pf.lo, a + c, k, t, &keep, &mut |code, s| {
+                enumerate(&pf.lo, &(a + c..a + c + k).collect::<Vec<_>>(), t, &keep, &mut |code, s| {
                     leaves += 1;
                     if set.get(slot(code, k)) {
                         top = top.max(s);
@@ -768,7 +812,7 @@ const WBINS: usize = 256; // quarter bits from 0
 /// each width among hits whose own diagonal reaches the bar.
 fn window(pf: &Pfam, idx: &Index, path: &str, bar: f32, out: &str) {
     let orfs = read_orfs(path);
-    let k = idx.k;
+    let k = idx.shape.kmer();
     let q: Vec<i32> = pf.lo.iter().map(|&v| (v * 4.0).round().max(-400.0) as i32).collect();
     let centred = std::env::var("FILTER_CENTRED").is_ok();
     let widths = if centred { CENTRED } else { WIDTHS };
@@ -876,7 +920,8 @@ fn window(pf: &Pfam, idx: &Index, path: &str, bar: f32, out: &str) {
 
 const WIN: usize = 48; // residues per posting, the k-mer at HALF..HALF + k
 const HALF: usize = 22;
-const STRIDE: usize = 32; // bytes per profile column: 21 residues, then padding
+const STRIDE: usize = 32; // bytes per profile column: 21 residues, X the last, then padding
+const OUTSIDE: u8 = 21; // a window's residue outside its ORF, in the column's padding
 
 /// The index in tiles: each tile is a run of whole models whose padded int8 profile has at most
 /// TILE_ROWS rows (2 MB), so it fits in L2 and an entry fits in a u16. Within a tile, entries are grouped by k-mer, so each postings list is read once
@@ -892,7 +937,7 @@ struct Tile {
     rows: Vec<u16>,
 }
 struct TileIndex {
-    k: usize,
+    shape: Shape,
     tiles: Vec<Tile>,
 }
 
@@ -938,7 +983,7 @@ fn tile(pf: &Pfam, idx: &Index, out: &str) {
         Tile { m0, m1, starts, rows }
     }).collect();
     let mut f = std::io::BufWriter::new(fs::File::create(out).unwrap());
-    f.write_all(bytes_of(&[idx.k as u64, tiles.len() as u64])).unwrap();
+    f.write_all(bytes_of(&[idx.shape.header(), tiles.len() as u64])).unwrap();
     for t in &tiles {
         f.write_all(bytes_of(&[t.m0 as u64, t.m1 as u64, t.rows.len() as u64])).unwrap();
         f.write_all(bytes_of(&t.starts)).unwrap();
@@ -951,7 +996,8 @@ fn load_tiles(path: &str) -> TileIndex {
     let mut f = std::io::BufReader::new(fs::File::open(path).unwrap());
     let mut h = [0u64; 2];
     f.read_exact(bytes_of_mut(&mut h)).unwrap();
-    let space = 20usize.pow(h[0] as u32);
+    let shape = Shape::from_header(h[0]);
+    let space = 20usize.pow(shape.k() as u32);
     let tiles = (0..h[1]).map(|_| {
         let mut t = [0u64; 3];
         f.read_exact(bytes_of_mut(&mut t)).unwrap();
@@ -961,12 +1007,12 @@ fn load_tiles(path: &str) -> TileIndex {
         f.read_exact(bytes_of_mut(&mut rows)).unwrap();
         Tile { m0: t[0] as usize, m1: t[1] as usize, starts, rows }
     }).collect();
-    TileIndex { k: h[0] as usize, tiles }
+    TileIndex { shape, tiles }
 }
 
 /// One block's postings, LANES at a time: per k-mer, groups of LANES windows stored offset-major
-/// (offset o of lane l at o * LANES + l), WIN residues each, 20 outside the ORF, all plus BIAS. Unused
-/// lanes hold 20 everywhere, so they score nothing, and orf u32::MAX.
+/// (offset o of lane l at o * LANES + l), WIN residues each, OUTSIDE beyond the ORF, all plus BIAS. Unused
+/// lanes hold OUTSIDE everywhere, so they score nothing, and orf u32::MAX.
 ///
 /// LANES is the widest register the architecture's kernel fills with one job: 32 bytes on AVX2, where the
 /// 16-byte halves of a profile column are broadcast, so nothing is assembled from two jobs. Wider groups
@@ -976,8 +1022,8 @@ const LANES: usize = 32;
 #[cfg(not(target_arch = "x86_64"))]
 const LANES: usize = 16;
 /// Added to every residue in a window, so that `pshufb`, which gives 0 for an index with its top bit set,
-/// looks up residues 0..16 as they are (0x70..0x80) and 16..21 with the top bit flipped (0x80..0x85 to
-/// 0..5): the two halves of a column are then joined with an OR.
+/// looks up residues 0..16 as they are (0x70..0x80) and 16..22 with the top bit flipped (0x80..0x86 to
+/// 0..6): the two halves of a column are then joined with an OR.
 const BIAS: u8 = if cfg!(target_arch = "x86_64") { 0x70 } else { 0 };
 /// Bits per lane in a mask, as each architecture's SIMD compare gives them.
 const LANE_BITS: usize = if cfg!(target_arch = "x86_64") { 1 } else { 4 };
@@ -992,11 +1038,14 @@ struct Postings {
     span: Vec<(u8, u8)>, // per group, the window offsets that hold a residue in some lane
 }
 
-fn postings(orfs: &[&[u8]], k: usize) -> Postings {
+/// The word at j is the residues `shape` takes from j on, and sits at the same place in the window as a k-mer would.
+fn postings(orfs: &[&[u8]], shape: Shape) -> Postings {
+    let (k, span, offsets) = (shape.k(), shape.span(), shape.offsets());
     let space = 20usize.pow(k as u32);
     let code_at = |f: &[u8], j: usize| -> Option<usize> {
         let mut code = 0usize;
-        for &c in &f[j..j + k] {
+        for &o in &offsets {
+            let c = f[j + o];
             if c >= 20 {
                 return None;
             }
@@ -1007,7 +1056,7 @@ fn postings(orfs: &[&[u8]], k: usize) -> Postings {
     // Each k-mer's postings sorted by where the ORF sits in the window, so a group's lanes share most of
     // their residue offsets and the kernel can skip offsets that are padding in every lane
     // filled in place at each ORF's offset, so the list is never held twice
-    let per_orf: Vec<usize> = orfs.par_iter().map(|f| (0..(f.len() + 1).saturating_sub(k)).filter(|&j| code_at(f, j).is_some()).count()).collect();
+    let per_orf: Vec<usize> = orfs.par_iter().map(|f| (0..(f.len() + 1).saturating_sub(span)).filter(|&j| code_at(f, j).is_some()).count()).collect();
     let mut at = Vec::with_capacity(orfs.len() + 1);
     at.push(0usize);
     for n in &per_orf {
@@ -1024,7 +1073,7 @@ fn postings(orfs: &[&[u8]], k: usize) -> Postings {
     parts.into_par_iter().enumerate().for_each(|(o, out)| {
         let f = orfs[o];
         let mut i = 0;
-        for j in 0..(f.len() + 1).saturating_sub(k) {
+        for j in 0..(f.len() + 1).saturating_sub(span) {
             if let Some(c) = code_at(f, j) {
                 out[i] = (c as u32, HALF.saturating_sub(j) as u8, (HALF + f.len() - j).min(WIN) as u8, o as u32, j as u16);
                 i += 1;
@@ -1046,7 +1095,7 @@ fn postings(orfs: &[&[u8]], k: usize) -> Postings {
     for c in 0..space {
         group_code[gstarts[c] as usize..gstarts[c + 1] as usize].fill(c as u32);
     }
-    let (mut windows, mut orf, mut pos) = (vec![20 + BIAS; groups * WIN * LANES], vec![u32::MAX; groups * LANES], vec![0u16; groups * LANES]);
+    let (mut windows, mut orf, mut pos) = (vec![OUTSIDE + BIAS; groups * WIN * LANES], vec![u32::MAX; groups * LANES], vec![0u16; groups * LANES]);
     let (mut covered, mut span) = (vec![0u64; groups], vec![(WIN as u8, 0u8); groups]);
     windows
         .par_chunks_mut(WIN * LANES)
@@ -1068,7 +1117,7 @@ fn postings(orfs: &[&[u8]], k: usize) -> Postings {
                 // the window holds the whole ORF, so its score is the whole diagonal's
                 *covered |= (((j <= HALF && f.len() <= j + WIN - HALF) as u64) * LANE) << (LANE_BITS * lane);
                 for x in start as usize..end as usize {
-                    w[x * LANES + lane] = f[j + x - HALF].min(20) + BIAS;
+                    w[x * LANES + lane] = f[j + x - HALF] + BIAS;
                 }
             }
         });
@@ -1306,14 +1355,14 @@ fn scorer4() -> (&'static str, Scorer4) {
 }
 
 /// A model's profile in quarter bits, int8, STRIDE bytes per column, with HALF columns of padding before
-/// and WIN - HALF after; padding and residue 20 score i8::MIN, which resets a local score.
+/// and WIN - HALF after; padding and OUTSIDE score i8::MIN, which resets a local score.
 fn int8_profile(pf: &Pfam, m: usize, out: &mut Vec<i8>) {
     let (a, b) = (pf.offs[m] as usize, pf.offs[m + 1] as usize);
     let at = out.len();
     out.resize(at + (b - a + WIN) * STRIDE, i8::MIN);
     let out = &mut out[at..];
     for c in 0..b - a {
-        for r in 0..20 {
+        for r in 0..21 {
             out[(c + HALF) * STRIDE + r] = (pf.lo[(a + c) * 21 + r] * 4.0).round().clamp(-127.0, 127.0) as i8;
         }
     }
@@ -1362,12 +1411,21 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
             dropped[c] = true;
         }
     }
+    // FILTER_DIAGONALS=all: score a pair in a band around every diagonal at the bar, not only its best one
+    let all_diagonals = std::env::var("FILTER_DIAGONALS").as_deref() == Ok("all");
     let covered_gate = (((bar - SLACK) * 4.0).floor().min(127.0) as i8).max(gate);
     // FILTER_MIN_GAPPED=g: write only pairs whose gapped score is at least g (HMMER's bar), so pairs scored
     // at the diagonal bar but below the hand-off are not formatted and written (324 M rows at diagonal 17).
     // Half a printed digit lower, so a score that prints as g is kept and readers' cut on the text decides.
     let min_gapped: f32 = std::env::var("FILTER_MIN_GAPPED").map_or(f32::NEG_INFINITY, |v| v.parse::<f32>().unwrap() - 0.005);
-    let bound = band.and_then(|b| Bound::new(pf, min_gapped, b));
+    // FILTER_GAPPED_FILE: a bar per model, one per line, where that is lower. A short repeat at GA scores less
+    // than any one bar for the rest: several copies of it add up to GA1
+    let min_gapped: Vec<f32> = match std::env::var("FILTER_GAPPED_FILE") {
+        Ok(p) => fs::read_to_string(p).unwrap().lines().map(|l| (l.trim().parse::<f32>().unwrap() - 0.005).min(min_gapped)).collect(),
+        Err(_) => vec![min_gapped; pf.models()],
+    };
+    assert_eq!(min_gapped.len(), pf.models(), "FILTER_GAPPED_FILE must hold a line per model");
+    let bound = band.and_then(|b| Bound::new(pf, &min_gapped, b));
     let bounded = AtomicU64::new(0); // pairs the bound lets through to the f32 score
     let (engine, score4) = scorer4();
     let (hits, survivors, pairs_n) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
@@ -1384,7 +1442,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         n_orfs += orfs.len();
         let chunk: Vec<&[u8]> = (0..orfs.len()).map(|i| orfs.seq(i)).collect();
         let t = Instant::now();
-        let p = postings(&chunk, ti.k);
+        let p = postings(&chunk, ti.shape);
         t_post += t.elapsed().as_secs_f64();
         let real: u64 = p.count.iter().map(|&c| c as u64).sum();
         eprintln!("block of {} ORFs: {} postings in {} groups, lanes filled {:.3}, {:.0} MB", chunk.len(), real,
@@ -1504,7 +1562,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                     let s = diagonal(pf, m as usize, col, f, j);
                     if s >= bar {
                         match res.last_mut() {
-                            Some(x) if x.0 == o && x.1 == m => {
+                            Some(x) if !all_diagonals && x.0 == o && x.1 == m => {
                                 if s > x.2 {
                                     (x.2, x.3) = (s, d);
                                 }
@@ -1517,6 +1575,13 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 let ts = Instant::now();
                 use std::fmt::Write;
                 let (mut text, mut n) = (String::new(), 0u64);
+                // a pair's diagonals come one after the other, and it is written once, with its best scores
+                let mut pending: Option<(u32, u32, f32, f32)> = None;
+                let write = |text: &mut String, pair: Option<(u32, u32, f32, f32)>| {
+                    if let Some((o, m, d, g)) = pair {
+                        writeln!(text, "{}\t{m}\t{d:.2}\t{g:.2}", orfs.name(o as usize)).unwrap();
+                    }
+                };
                 for four in res.chunks(PAIRS) {
                     let reach = bound.as_ref().map_or([true; PAIRS], |b| {
                         // a short last chunk repeats its first pair
@@ -1526,7 +1591,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         }))
                     });
                     for (&(o, m, d, diag), _) in four.iter().zip(reach).filter(|(_, r)| *r) {
-                        let (name, f) = (orfs.name(o as usize), chunk[o as usize]);
+                        let f = chunk[o as usize];
                         n += 1;
                         let a = pf.offs[m as usize] as usize;
                         let cols = pf.offs[m as usize + 1] as usize - a;
@@ -1534,11 +1599,15 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             Some(b) => gapped_band(&pf.lo, a, cols, f, diag, b, h, del),
                             None => gapped(&pf.lo, a, cols, f, h, del),
                         };
-                        if g >= min_gapped {
-                            writeln!(text, "{name}\t{m}\t{d:.2}\t{g:.2}").unwrap();
+                        if g >= min_gapped[m as usize] {
+                            match &mut pending {
+                                Some(p) if p.0 == o && p.1 == m => (p.2, p.3) = (p.2.max(d), p.3.max(g)),
+                                _ => write(&mut text, pending.replace((o, m, d, g))),
+                            }
                         }
                     }
                 }
+                write(&mut text, pending);
                 bounded.fetch_add(n, Relaxed);
                 pairs_n.fetch_add(res.len() as u64, Relaxed);
                 gap_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
@@ -1563,15 +1632,200 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     );
 }
 
+// What a seed would do at each threshold, model by model, from the HMM alone.
+const READ: usize = 50; // residues in a read of 150 nt
+const THRESHOLDS: usize = 25; // steps of a quarter bit from lowest_t
+const Q: [f64; 20] = [0.0787945, 0.0151600, 0.0535222, 0.0668298, 0.0397062, 0.0695071, 0.0229198, 0.0590092, 0.0594422, 0.0963728,
+    0.0237718, 0.0414386, 0.0482904, 0.0395639, 0.0540978, 0.0683364, 0.0540687, 0.0673417, 0.0114135, 0.0304133]; // prep.py's background
+fn lowest_t(shape: Shape) -> f32 { if shape.k() == 3 { 3.0 } else { 4.5 } }
+const PER_BIT: f32 = 8.0; // bins of a score histogram
+const LOW: f32 = -6.0; // a residue below this is in no word worth having
+const ONE: usize = 128; // bins of one column's scores, LOW..10
+const TWO: usize = 2 * ONE; // of two columns' sum
+
+/// How each column's residues are drawn in a read that just reaches GA: p(r) ~ Q(r) 2^(beta score(r)), beta set for
+/// each READ-column stretch so that its mean score is `need`. Gives every column's beta, by the stretch it is
+/// the middle of, and each stretch's weight: one that needs a stronger tilt holds fewer of the reads that pass.
+fn tilts(lo: &[f32], cols: usize, need: f64) -> (Vec<f64>, Vec<f64>) {
+    let betas: Vec<f64> = (0..20).map(|i| 0.2 + 3.8 * i as f64 / 19.0).collect();
+    let n = READ.min(cols);
+    let mut beta = vec![*betas.last().unwrap(); cols - n + 1];
+    let mut done = vec![false; cols - n + 1];
+    let mut before = vec![f64::NAN; cols - n + 1];
+    for (b, &x) in betas.iter().enumerate() {
+        let mean: Vec<f64> = (0..cols).map(|c| {
+            let (mut z, mut e) = (0.0, 0.0);
+            for r in 0..20 {
+                let l = lo[c * 21 + r] as f64;
+                let w = Q[r] * (x * l).exp2();
+                z += w;
+                e += w * l;
+            }
+            e / z
+        }).collect();
+        let mut sum: f64 = mean[..n].iter().sum();
+        for w in 0..beta.len() {
+            if w > 0 {
+                sum += mean[w + n - 1] - mean[w - 1];
+            }
+            // a stretch's mean score rises with beta
+            if !done[w] && sum >= need {
+                beta[w] = if b == 0 { x } else { betas[b - 1] + (x - betas[b - 1]) * (need - before[w]) / (sum - before[w]) };
+                done[w] = true;
+            }
+            before[w] = sum;
+        }
+    }
+    let least = beta.iter().copied().fold(f64::MAX, f64::min);
+    let weight = beta.iter().map(|b| (-4.0 * (b - least)).exp2()).collect();
+    let column = (0..cols).map(|c| beta[c.saturating_sub(n / 2).min(beta.len() - 1)]).collect();
+    (column, weight)
+}
+
+/// Per shape and T: background hits per residue, and -ln P(a read at GA holds no word), words taken as independent.
+/// A word of four is a pair of residues and another pair, a word of three a pair and one, so every shape with a gap in common
+/// shares that gap's pair histograms, and a word's score distribution is one histogram against the other's tail.
+fn seed_scores(lo: &[f32], cols: usize, need: f64, shapes: &[Shape]) -> Vec<f32> {
+    let (beta, weight) = tilts(lo, cols, need);
+    let mut p = vec![[0.0f32; 20]; 2 * cols]; // background, then tilted, per column
+    let mut bin = vec![[None::<usize>; 20]; cols];
+    for c in 0..cols {
+        let w: Vec<f64> = (0..20).map(|r| Q[r] * (beta[c] * lo[c * 21 + r] as f64).exp2()).collect();
+        let z: f64 = w.iter().sum();
+        let q: f64 = Q.iter().sum();
+        for r in 0..20 {
+            p[2 * c][r] = (Q[r] / q) as f32;
+            p[2 * c + 1][r] = (w[r] / z) as f32;
+            let b = ((lo[c * 21 + r] - LOW) * PER_BIT).round();
+            bin[c][r] = (b >= 0.0).then(|| (b as usize).min(ONE - 1));
+        }
+    }
+    // histograms of a pair `gap` apart from column c, and one column's: [2 * c + e] is a run of bins
+    let pairs = |gap: usize| -> Vec<f32> {
+        let mut h = vec![0.0f32; cols.saturating_sub(gap) * 2 * TWO];
+        for c in 0..cols.saturating_sub(gap) {
+            for x in 0..20 {
+                let Some(bx) = bin[c][x] else { continue };
+                for y in 0..20 {
+                    let Some(by) = bin[c + gap][y] else { continue };
+                    for e in 0..2 {
+                        h[(2 * c + e) * TWO + bx + by] += p[2 * c + e][x] * p[2 * (c + gap) + e][y];
+                    }
+                }
+            }
+        }
+        h
+    };
+    let tails = |mut h: Vec<f32>, bins: usize| -> Vec<f32> {
+        for run in h.chunks_mut(bins) {
+            for b in (0..bins - 1).rev() {
+                run[b] += run[b + 1];
+            }
+        }
+        h
+    };
+    let mut ones = vec![0.0f32; 2 * cols * ONE];
+    for c in 0..cols {
+        for r in 0..20 {
+            if let Some(b) = bin[c][r] {
+                ones[2 * c * ONE + b] += p[2 * c][r];
+                ones[(2 * c + 1) * ONE + b] += p[2 * c + 1][r];
+            }
+        }
+    }
+    let ones = tails(ones, ONE);
+    let (mut first, mut second): (Vec<Option<Vec<f32>>>, Vec<Option<Vec<f32>>>) = (vec![None; 16], vec![None; 16]);
+    let mut out = vec![0.0f32; shapes.len() * 2 * THRESHOLDS];
+    for (shape, out) in shapes.iter().zip(out.chunks_mut(2 * THRESHOLDS)) {
+        let at = shape.offsets();
+        if cols < shape.span() {
+            continue;
+        }
+        let gap = at[1];
+        if first[gap].is_none() {
+            first[gap] = Some(pairs(gap));
+        }
+        let (tail, bins, tail_at) = if at.len() == 4 {
+            let gap = at[3] - at[2];
+            if second[gap].is_none() {
+                second[gap] = Some(tails(pairs(gap), TWO));
+            }
+            (second[gap].as_ref().unwrap(), TWO, at[2])
+        } else {
+            (&ones, ONE, at[2])
+        };
+        let head = first[gap].as_ref().unwrap();
+        let lowest = ((lowest_t(*shape) - at.len() as f32 * LOW) * PER_BIT).round() as usize;
+        let starts = cols - shape.span() + 1;
+        let mut expect = vec![0.0f64; starts * THRESHOLDS]; // words a start column is expected to give a read at GA
+        for c in 0..starts {
+            for e in 0..2 {
+                let h = &head[(2 * c + e) * TWO..][..TWO];
+                let t = &tail[(2 * (c + tail_at) + e) * bins..][..bins];
+                let top = h.iter().rposition(|&x| x > 0.0).map_or(0, |b| b + 1);
+                let reach = |at: usize| -> f32 { (at.saturating_sub(bins - 1)..top).map(|b| h[b] * t[at.saturating_sub(b)]).sum() };
+                for i in 0..THRESHOLDS {
+                    let at = lowest + i * (PER_BIT as usize / 4);
+                    // a bin holds the scores that round to it, half of the first one's below T
+                    let v = 0.5 * (reach(at) + reach(at + 1));
+                    if e == 0 { out[i] += v } else { expect[c * THRESHOLDS + i] = v as f64 }
+                }
+            }
+        }
+        let width = (READ.min(cols) - shape.span().min(READ.min(cols)) + 1).min(starts);
+        for i in 0..THRESHOLDS {
+            let (mut run, mut none, mut total) = (0.0, 0.0, 0.0);
+            for c in 0..starts {
+                run += expect[c * THRESHOLDS + i];
+                if c >= width {
+                    run -= expect[(c - width) * THRESHOLDS + i];
+                }
+                if c + 1 >= width {
+                    let w = weight.get(c + 1 - width).copied().unwrap_or(0.0);
+                    total += w;
+                    none += w * (-run).exp();
+                }
+            }
+            out[THRESHOLDS + i] = -(none / total + 1e-12).ln() as f32;
+        }
+    }
+    out
+}
+
+/// The table choose_seeds.py reads: f32, models x shapes x (hits, quality) x THRESHOLDS. GA: accession, GA1, GA2 per line.
+fn seeds(pf: &Pfam, prep: &str, ga: &str, shapes: &[Shape], out: &str) {
+    let t0 = Instant::now();
+    let ga2: std::collections::HashMap<String, f64> = fs::read_to_string(ga).unwrap().lines().map(|l| {
+        let mut c = l.split_whitespace();
+        (c.next().unwrap().to_string(), c.nth(1).unwrap().parse().unwrap())
+    }).collect();
+    let accs = fs::read_to_string(format!("{prep}/accs.txt")).unwrap();
+    let accs: Vec<&str> = accs.lines().collect();
+    assert_eq!(accs.len(), pf.models());
+    let rows: Vec<Vec<f32>> = (0..pf.models()).into_par_iter().map(|m| {
+        let (a, b) = (pf.offs[m] as usize, pf.offs[m + 1] as usize);
+        let cols = b - a;
+        // raw bits a domain at GA2 has: HMMER's score, plus what entering the model and the ORF's length cost it
+        let need = ga2[accs[m]] + (cols as f64 * (cols as f64 + 1.0) / 2.0).log2() + 2.0 * (READ as f64 / 2.0 + 1.5).log2() - (READ as f64 + 1.0).log2();
+        seed_scores(&pf.lo[a * 21..b * 21], cols, need, shapes)
+    }).collect();
+    let mut f = std::io::BufWriter::new(fs::File::create(out).unwrap());
+    for r in &rows {
+        f.write_all(bytes_of(r)).unwrap();
+    }
+    eprintln!("{} models, {} shapes, {:.0} s", pf.models(), shapes.len(), t0.elapsed().as_secs_f32());
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let pf = Pfam::load(&a[2]);
     match a[1].as_str() {
-        "build" => build(&pf, a[3].parse().unwrap(), a[4].parse().unwrap(), &a[5]),
+        "build" => build(&pf, Shape::parse(&a[3]), a[4].parse().unwrap(), &a[5]),
         "search" => search(&pf, &load_index(&a[3]), &a[4], a[5].parse().unwrap(), &a[6], a.get(7)),
         "window" => window(&pf, &load_index(&a[3]), &a[4], a[5].parse().unwrap(), &a[6]),
         "tile" => tile(&pf, &load_index(&a[3]), &a[4]),
         "join" => join(&pf, &load_tiles(&a[3]), &a[7], a[4].parse().unwrap(), a[5].parse().unwrap(), a[6].parse().unwrap(), &a[8]),
+        "seeds" => seeds(&pf, &a[2], &a[3], &a[5].split(',').map(Shape::parse).collect::<Vec<_>>(), &a[4]),
         "sketch" => sketch(&pf, &a[3], a[4].parse().unwrap(), a[5].parse().unwrap(), a[6].parse().unwrap(), a[7] == "rev", &a[8]),
         _ => panic!("build | search | sketch"),
     }
@@ -1588,11 +1842,40 @@ mod tests {
         lo[0] = 5.0;
         lo[21] = 5.0;
         let mut seen = vec![];
-        enumerate(&lo, 0, 2, 9.0, &|_, _| true, &mut |c, s| seen.push((c, s)));
+        enumerate(&lo, &[0, 1], 9.0, &|_, _| true, &mut |c, s| seen.push((c, s)));
         assert_eq!(seen, vec![(0, 10.0)]);
         seen.clear();
-        enumerate(&lo, 0, 2, 9.0, &|i, _| i < 2, &mut |c, s| seen.push((c, s)));
+        enumerate(&lo, &[0, 1], 9.0, &|i, _| i < 2, &mut |c, s| seen.push((c, s)));
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn a_spaced_word_is_the_same_word_in_the_index_and_in_a_read() {
+        for (text, k, span) in [("3", 3, 3), ("1011001", 4, 7), ("11001", 3, 5)] {
+            let shape = Shape::parse(text);
+            assert_eq!((shape.k(), shape.span(), Shape::from_header(shape.header())), (k, span, shape));
+            // a model whose consensus is a read, with every other residue hopeless, holds exactly the read's words
+            let f: Vec<u8> = (0..30).map(|i| (i * 7 % 20) as u8).collect();
+            let lo: Vec<f32> = f.iter().flat_map(|&b| (0..21u8).map(move |r| if r == b { 4.0 } else { -9.0 })).collect();
+            let words: Vec<usize> = (0..=f.len() - span)
+                .map(|c| {
+                    let mut seen = vec![];
+                    enumerate(&lo, &shape.offsets().iter().map(|o| c + o).collect::<Vec<_>>(), 4.0 * k as f32, &|_, _| true, &mut |w, _| seen.push(w));
+                    assert_eq!(seen.len(), 1);
+                    seen[0]
+                })
+                .collect();
+            let p = postings(&[&f], shape);
+            let mut in_read = vec![usize::MAX; words.len()];
+            for w in 0..p.count.len() {
+                for g in p.gstarts[w] as usize..p.gstarts[w + 1] as usize {
+                    for lane in (0..LANES).filter(|l| p.orf[g * LANES + l] == 0) {
+                        in_read[p.pos[g * LANES + lane] as usize] = w;
+                    }
+                }
+            }
+            assert_eq!(in_read, words, "{text}");
+        }
     }
 
     #[test]
@@ -1600,10 +1883,10 @@ mod tests {
         let mut x = 99u64;
         let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
         // scores up to 60 a column, so some lanes saturate
-        let prof: Vec<i8> = (0..3 * WIN * STRIDE).map(|i| if i % STRIDE >= 20 { i8::MIN } else { (next() % 90) as i8 - 30 }).collect();
+        let prof: Vec<i8> = (0..3 * WIN * STRIDE).map(|i| if i % STRIDE > 20 { i8::MIN } else { (next() % 90) as i8 - 30 }).collect();
         for t in 0..400 {
             // residues and padding, or only well-scoring ones
-            let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..WIN * LANES).map(|_| (next() % 21) as u8 + BIAS).collect()).collect();
+            let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..WIN * LANES).map(|_| (next() % 22) as u8 + BIAS).collect()).collect();
             // four groups, or one for all four jobs
             let w = [0, 1, 2, 3].map(|i| &ws[if t % 2 == 0 { i } else { 0 }][..]);
             let rows = [0, 1, 2, 3].map(|_| (next() % (2 * WIN as u64)) as usize);
@@ -1615,6 +1898,69 @@ mod tests {
                 kernel(&prof, rows, w, span, gates, &mut got);
                 assert_eq!(got, want, "{name}");
             }
+        }
+    }
+
+    #[test]
+    fn an_unknown_residue_does_not_end_an_alignment() {
+        // a 30-column model that scores 1 bit for one residue a column, and a read of it with an X at 15
+        let n = 30;
+        let mut lo: Vec<f32> = (0..n * 21).map(|i| if i % 21 == i / 21 % 20 { 1.0 } else { -0.5 }).collect();
+        lo.chunks_mut(21).for_each(score_unknown);
+        let pf = Pfam { lo, offs: vec![0, n as u32] };
+        let mut f: Vec<u8> = (0..n as u8).map(|c| c % 20).collect();
+        f[15] = 20;
+        let want = 1.0 * (n - 1) as f32 + (Q[15] * 1.5 / Q.iter().sum::<f64>() - 0.5) as f32;
+        assert!((diagonal(&pf, 0, 0, &f, 0) - want).abs() < 1e-3);
+        assert!((gapped(&pf.lo, 0, n, &f, &mut vec![], &mut vec![]) - want).abs() < 1e-3);
+        // the window of the word at 0 holds 26 residues and padding before them: in quarter bits 25 x 4 - 2 through
+        // the X, and 15 x 4 if it broke the run
+        let p = postings(&[&f], Shape::parse("4"));
+        let mut prof = vec![];
+        int8_profile(&pf, 0, &mut prof);
+        let at = (0..p.orf.len()).find(|&l| p.orf[l] == 0 && p.pos[l] == 0).unwrap();
+        let w = &p.windows[at / LANES * WIN * LANES..][..WIN * LANES];
+        for (name, kernel) in scorers() {
+            let mut got: Masks = [(0, 0); 4];
+            kernel(&prof, [0; 4], [w; 4], (0, WIN), (98, 99), &mut got);
+            let lane = LANE << (LANE_BITS * (at % LANES));
+            assert!(got[0].0 & lane != 0 && got[0].1 & lane == 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn seed_scores_are_what_enumerating_gives() {
+        let mut x = 5u64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let cols = 14;
+        let lo: Vec<f32> = (0..cols * 21).map(|i| if i % 21 == 20 { -100.0 } else { (next() % 1000) as f32 / 1000.0 * 9.0 - 5.0 }).collect();
+        let shapes = ["1101001", "1011", "11001", "111"].map(Shape::parse);
+        let table = seed_scores(&lo, cols, 20.0, &shapes);
+        let z: f64 = Q.iter().sum();
+        for (shape, row) in shapes.iter().zip(table.chunks(2 * THRESHOLDS)) {
+            for i in [0, 4, 8] {
+                let t = lowest_t(*shape) + 0.25 * i as f32;
+                let exact = |t: f32| -> f64 {
+                    (0..=cols - shape.span()).map(|c| {
+                        let mut p = 0.0;
+                        let at: Vec<usize> = shape.offsets().iter().map(|o| c + o).collect();
+                        enumerate(&lo, &at, t, &|_, _| true, &mut |code, _| {
+                            let (mut w, mut code) = (1.0, code);
+                            for _ in 0..at.len() {
+                                w *= Q[code % 20] / z;
+                                code /= 20;
+                            }
+                            p += w;
+                        });
+                        p
+                    }).sum()
+                };
+                // a score is rounded to an eighth of a bit per residue
+                let (more, less) = (exact(t - 0.2), exact(t + 0.2));
+                assert!((less..=more).contains(&(row[i] as f64)), "{shape:?} T {t}: {} not in {less}..{more}", row[i]);
+            }
+            let quality = &row[THRESHOLDS..];
+            assert!(quality.windows(2).all(|w| w[0] >= w[1] - 1e-3) && quality[0] > 0.0);
         }
     }
 
@@ -1639,7 +1985,9 @@ mod tests {
         let (mut kept, mut dropped) = (0, 0);
         // at 40 a gap of more than 16 columns can still pay, which the wide band's last step is for
         for (min, band) in [17.0f32, 21.25, 26.25, 40.0].into_iter().flat_map(|min| [8i64, 16, 3, 12].map(|band| (min, band))) {
-            let Some(b) = Bound::new(&pf, min - 0.005, band) else { return }; // no SIMD here
+            // one model with a lower bar than the others, below what one bar for all may be
+            let mins = [min - 0.005, min - 0.005, 13.0 - 0.005];
+            let Some(b) = Bound::new(&pf, &mins, band) else { return }; // no SIMD here
             let (mut h, mut del) = (vec![], vec![]);
             for _ in 0..3000 {
                 let mut pairs: Vec<(usize, Vec<u8>, i64)> = vec![];
@@ -1674,8 +2022,8 @@ mod tests {
                 let reach = b.may_reach(std::array::from_fn(|i| (pairs[i].0, &pairs[i].1[..], pairs[i].2)));
                 for ((m, f, d), reach) in pairs.iter().zip(reach) {
                     let g = gapped_band(&pf.lo, pf.offs[*m] as usize, lens[*m], f, *d, band, &mut h, &mut del);
-                    assert!(reach || g < min - 0.005, "dropped {g} at {min}, band {band}");
-                    (kept, dropped) = (kept + (g >= min) as usize, dropped + !reach as usize);
+                    assert!(reach || g < mins[*m], "dropped {g} at {}, band {band}", mins[*m]);
+                    (kept, dropped) = (kept + (g >= mins[*m]) as usize, dropped + !reach as usize);
                 }
             }
         }

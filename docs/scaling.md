@@ -274,6 +274,18 @@ The unit test covers bands 3, 8, 12 and 16, at a bar high enough (26 bits and up
 faults in the step, the edges and the joins between registers (nine on ARM, three in the AVX2 code). It passes 25.6 M random pairs on ARM. Under Rosetta the AVX2 build passes it and
 writes ARM's pairs on 4,000 ORFs. Not timed on x86.
 
+### Spaced seeds (2026-11-23)
+
+`filter build PREP SHAPE T` takes a shape, 1011001 say, in place of k: the residues a word takes. The shape is in the index's header
+(a k-mer's is k, as before), and only the index and the cutting of reads into words change: not the kernel. Indexes for a k-mer
+are byte for byte what they were. `search`, `window` and `sketch` read k-mers only.
+
+`filter seeds PREP GA.tsv OUT SHAPES` tabulates, for each model, shape and T, background hits and -ln P(a read that just reaches GA
+holds no word), to choose a T per model. `FILTER_DIAGONALS=all` scores a pair's band around every diagonal at the bar.
+
+For recall they are better than contiguous words at equal cost, and catch repeats with a period (Collagen's
+Gly-X-Y) that a 3-mer cannot: raw-reads-analysis-pipeline, `docs/plans/kfpfam-recall.md`.
+
 ## Ranked plan
 
 | # | Change | Expected | Recall cost | Effort |
@@ -321,3 +333,11 @@ Pfam release, with 53,275 models. See
 The only genuine blind spot here is three models too short to carry a 4-mer above any bar:
 PF02044 Bombesin (14 columns), PF08261 Carcinustatin (8), PF03373 Octapeptide (8).
 `representativeness.py models` reports them, and a rise above three is a build failure.
+
+**Unknown residues.** X scored -100 and ended every alignment; HMMER scores it at the column's mean over the background and carries
+on. The filter now does too, when it loads the profile, so an old prep needs no rebuild (seeds still hold no X). In bird gut's B11 reads
+12 of the 21 pairs the best mode lost held an X. 7,796 V3 pairs with one residue masked: 7 lost before, 1 after.
+
+**`FILTER_GAPPED_FILE`**: a gapped bar per model, one per line, where that is lower than `FILTER_MIN_GAPPED`. A short repeat reaches GA1 as
+several copies, each under any bar that suits the rest. The bars are the raw score of a domain at GA2 less 4 bits; on V3's ORFs they add 6% to candidates at
+bar 15 and 10-12% at 17 and 20, and nothing to the filter's time.

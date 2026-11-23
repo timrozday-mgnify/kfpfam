@@ -46,6 +46,7 @@ def main():
     p = np.exp(-emit)
     lo = np.log2(p / Q)
     rel = (p * lo).sum(1)
+    # the filter puts an unknown residue's score in the last column itself, as HMMER has it
     table = np.hstack([lo, np.full((len(lo), 1), -100.0)]).astype(np.float32)
     table.tofile(out / "profile.f32")
     offs.tofile(out / "offs.u32")
