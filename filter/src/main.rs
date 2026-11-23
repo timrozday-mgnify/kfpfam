@@ -889,7 +889,9 @@ fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], out: &mut [[i8; LAN
 }
 
 fn scorer4() -> Scorer4 {
-    if std::env::var("FILTER_SIMD").as_deref() == Ok("scalar") {
+    // FILTER_SIMD=generic keeps this CPU's per-group kernel but drops the fused four-job one, which
+    // is what x86 gets today (there is no score4_sse41), so the loss is measurable on any machine.
+    if matches!(std::env::var("FILTER_SIMD").as_deref(), Ok("scalar") | Ok("generic")) {
         return score4_generic;
     }
     #[cfg(target_arch = "aarch64")]
@@ -898,7 +900,7 @@ fn scorer4() -> Scorer4 {
     score4_generic
 }
 
-/// The fastest scorer this CPU has, unless FILTER_SIMD=scalar.
+/// The fastest scorer this CPU has, unless FILTER_SIMD=scalar (FILTER_SIMD=generic keeps it).
 fn scorer() -> (Scorer, &'static str) {
     if std::env::var("FILTER_SIMD").as_deref() == Ok("scalar") {
         return (score_scalar, "scalar");
