@@ -785,14 +785,12 @@ fn tile_bases(pf: &Pfam, m0: usize, m1: usize) -> Vec<usize> {
 }
 
 fn tile(pf: &Pfam, idx: &Index, out: &str) {
-    // FILTER_TILE_ROWS=n: smaller tiles than TILE_ROWS, for an L2 under 2 MB
-    let tile_rows = std::env::var("FILTER_TILE_ROWS").map_or(TILE_ROWS, |v| v.parse().unwrap()).min(TILE_ROWS);
     let mut bounds = vec![0usize];
     let mut rows_in = 0usize;
     for m in 0..pf.models() {
         let rows_m = (pf.offs[m + 1] - pf.offs[m]) as usize + WIN;
         assert!(rows_m <= TILE_ROWS);
-        if rows_in > 0 && rows_in + rows_m > tile_rows {
+        if rows_in + rows_m > TILE_ROWS {
             bounds.push(m);
             rows_in = 0;
         }
@@ -1324,9 +1322,8 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         continue;
                     }
                     n_hits += (r1 - r0) as u64 * p.count[code] as u64;
-                    // Four rows against every group in turn: their 48 columns (6 KB) and the k-mer's windows stay
-                    // in L1, where one group against every row would read a longer run of profile again per
-                    // group. Rows left over wait for company, whatever its k-mer.
+                    // Four rows against every group in turn, so a profile row is read once per k-mer. Rows left
+                    // over wait for company, whatever its k-mer.
                     let rows = &tile.rows[r0..r1];
                     let whole = rows.len() / 4 * 4;
                     for four in rows[..whole].chunks_exact(4) {

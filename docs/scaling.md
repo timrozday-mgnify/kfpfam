@@ -216,21 +216,44 @@ instruction. Same node, ORFs and settings; every run gave `f40154c`'s 4,498,149 
 Two predictions were wrong:
 
 - **AVX-512 is 1.13x AVX2 on the join, not 3x.** llvm-mca assumes every load hits L1. With the
-  arithmetic this cheap the join waits on something else, most likely the profile: a batch reads 4.6 KB
-  of it, the rows of one k-mer (35-65 KB, estimated) outgrow a 48 KB L1, and a tile (2 MB) outgrows a
-  1 MB L2.
+  arithmetic this cheap the join waits on something else. The profile's rows were the guess, as they
+  outgrow L1 and a tile outgrows L2; the next section tests that, and it isn't so.
 - **Block size doesn't matter.** 1.6 M ORFs at AVX-512: 262, 270 and 262 core-s in blocks of 400,000,
   800,000 and 1.6 M, for 3.9, 4.8 and 6.5 GB. Fuller groups save the kernel what longer survivor lists
   then cost (47 → 64 core-s). `kfpfam_block` stays at 400,000.
 
-Next, output unchanged, not timed on Codon: **four rows now meet every group of a k-mer in turn**, where
-one group met every row, so each profile row is read from L2 once per k-mer and tile (laptop: join about
-26 → 24.5 core-s, and 52 → 31 for the whole run since `f40154c`, on 309,149 ORFs); a batch without a survivor skips
-the survivor scan. `FILTER_TILE_ROWS` makes smaller tiles at `filter tile`, for `speed_test.sh` to try.
+### Where it stops paying (2026-11-23)
 
-In cpu-h: the B11 arms ran `generic`, 1,053 core-s here, and Mode A cost 2,153 cpu-h, so 125 is about
-250 (both against 53,275 models; a projection). nail's 287 was against 30,134 models, so it needs
-measuring again on 39.0 before the two are compared.
+`fd1f74c`: four rows meet every group of a k-mer in turn, where one group met every row, so a profile row
+is read once per k-mer and tile; and a batch without a survivor skips the survivor scan. Same node, ORFs
+and settings, AVX-512, the same pairs from every run:
+
+| | core-s | join | gapped | survivors (in join) |
+|---|---|---|---|---|
+| Mode A, one group against every row | 121 | 89 | 27 | 19 |
+| Mode A, four rows against every group | 121 | 90 | 27 | 20 |
+| — tiles of 32,768 rows (315, against about 157) | 160 | 122 | 33 | 27 |
+| — tiles of 16,384 rows (632) | 175 | 140 | 30 | 28 |
+| Mode B, one group against every row | 52 | 45 | 2.3 | 13 |
+| Mode B, four rows against every group | 56 | 49 | 2.4 | 15 |
+
+The loop order makes no difference there (it stays: 7% on the join of the laptop). Mode B's 52 against 56
+is one run each, and its survivor stage, which didn't change, is slower by as much in proportion.
+Smaller tiles don't help: some of the slowdown is the node (the gapped and survivor stages, the same
+work, are 12 to 40% slower in those runs) but not all of it, and L2 is therefore not what the join waits
+on. `FILTER_TILE_ROWS` is gone again. What it does wait on is not known: three guesses here were wrong,
+so the next step would be `perf stat` on a node rather than a fourth.
+
+From the two modes, the join without survivors is about 0.6 ns per hit plus 14 to 18 core-s whatever the
+hits: an eighth of Mode A's total, and a third of Mode B's. The per-hit part is within 1.6x of llvm-mca's figure
+for the kernel alone.
+
+In cpu-h, scaling Mode A's 2,153 by core-s on these ORFs: **Mode A about 250, Mode B about 110** (Mode B's
+arm took 585). Both are against 53,275 models, and projections from one chunk; nail's 287 was against
+30,134, so it needs measuring again on 39.0 before they are compared.
+
+The lever left is fewer residues. The pipeline's ORF filter kept 62% of them for 0.18% of reads, and
+the filter is linear in residues, so about 155 and 70 cpu-h if that holds for kfpfam. Not run with it.
 
 ## Ranked plan
 
@@ -241,7 +264,8 @@ measuring again on 39.0 before the two are compared.
 | 2b | 32 lanes, one job per AVX2 register | 1.3–1.9× beyond #2a (predicted) | **none** | **done**: join 167 → 123 core-s on Codon at 400,000 per block |
 | 2c | SIMD bound before the gapped score | 6.6× on that stage on Codon | **none** | **done** |
 | 2d | AVX-512 VBMI | 1.13× on the join on Codon | **none** | **done** |
-| 2e | Four rows against every group; smaller tiles | unknown: the join waits on memory | **none** | loop done, tiles optional; time on Codon |
+| 2e | Four rows against every group; smaller tiles | none on Codon; smaller tiles slower | **none** | loop kept, tiles dropped |
+| 2f | The pipeline's ORF filter in front | 1.6× | 0.18% of reads with `hmmsearch` | config only; not run with kfpfam |
 | 3 | GA-only settings for RawR: bar 22, min_gapped ~24, not bar 17 | 1.5× | .999 → .995 ≥GA | config only |
 | 4 | T7.5 for RawR instead of T6.5 | 2.3× | .995 → .984 ≥GA | config only |
 | 5 | Per-model T as a length rule | 1.2× | none at equal hits | implemented (`FILTER_T_FILE`), needs the rule |
