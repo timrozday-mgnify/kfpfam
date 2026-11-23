@@ -14,6 +14,11 @@ Two headline numbers from this repo's README did not survive:
 Neither gap is a measurement error in the pipeline. Both are blind spots in how this repo measures.
 Reproduce the coverage figures with `measure/representativeness.py`.
 
+> **Update, 2026-11-23.** Codon's prep and index were built from Pfam 39.0 (`current_release`), with 53,275 models
+> against the 30,134 HMMER read. That explains 164 of the 183 families and about 1.7× of the cost gap
+> below; the rest of the gap was the missing fused x86 kernel and the scalar gapped score (see
+> [scaling](scaling.md)). The blind spots this page describes are still real.
+
 ## 1. The recall figure cannot see a missing model
 
 `measure/index_score.py` computes recall as the share of (read, model) truth pairs at or above GA
