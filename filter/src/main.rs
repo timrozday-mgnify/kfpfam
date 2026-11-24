@@ -1438,6 +1438,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     let (hits, survivors, pairs_n) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let (surv_ns, unique, gap_ns) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)); // surv: sort, dedupe and exact diagonals
     let (mut t_post, mut t_join) = (0.0f64, 0.0f64);
+    // FILTER_BINARY=1: per block its ORFs, residues and bytes of pairs (u64), then the pairs, (ORF in the block, model) as
+    // two u32 in model order, little endian. For a reader that streams the same FASTA beside it: 8 bytes a pair, not 60
+    let binary = std::env::var("FILTER_BINARY").is_ok_and(|v| v == "1");
     let mut sink = std::io::BufWriter::new(fs::File::create(out).unwrap());
     let threads = rayon::current_num_threads() as f64;
     let t0 = Instant::now();
@@ -1457,7 +1460,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         let t = Instant::now();
         // each tile's pairs are scored and formatted before the next tile's are found, so a block holds its
         // text, not its pairs
-        let rows: Vec<String> = ti.tiles
+        let rows: Vec<Vec<u8>> = ti.tiles
             .par_iter()
             .map_init(|| (Vec::<i8>::new(), Vec::<u64>::new(), vec![], vec![]), |(prof, surv, h, del), tile| {
                 let base = tile_bases(pf, tile.m0, tile.m1);
@@ -1580,12 +1583,17 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 }
                 surv_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
                 let ts = Instant::now();
-                use std::fmt::Write;
-                let (mut text, mut n) = (String::new(), 0u64);
+                use std::io::Write;
+                let (mut text, mut n) = (Vec::<u8>::new(), 0u64);
                 // a pair's diagonals come one after the other, and it is written once, with its best scores
                 let mut pending: Option<(u32, u32, f32, f32)> = None;
-                let write = |text: &mut String, pair: Option<(u32, u32, f32, f32)>| {
+                let write = |text: &mut Vec<u8>, pair: Option<(u32, u32, f32, f32)>| {
                     if let Some((o, m, d, g)) = pair {
+                        if binary {
+                            text.extend_from_slice(&o.to_le_bytes());
+                            text.extend_from_slice(&m.to_le_bytes());
+                            return;
+                        }
                         writeln!(text, "{}\t{m}\t{d:.2}\t{g:.2}", orfs.name(o as usize)).unwrap();
                     }
                 };
@@ -1625,8 +1633,17 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
             })
             .collect();
         t_join += t.elapsed().as_secs_f64();
+        if binary {
+            for x in [orfs.len(), orfs.seqs.len(), rows.iter().map(Vec::len).sum()] {
+                sink.write_all(&(x as u64).to_le_bytes()).unwrap();
+            }
+        }
         for r in rows {
-            sink.write_all(r.as_bytes()).unwrap();
+            sink.write_all(&r).unwrap();
+        }
+        if binary {
+            // the reader works on a block while the next is searched
+            sink.flush().unwrap();
         }
     }
     sink.flush().unwrap();
