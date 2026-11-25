@@ -1492,7 +1492,8 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 let mut queued = 0usize;
                 let mut masks: Masks = [(0, 0); 4];
                 let mut span = (WIN, 0usize);
-                let drain = |jobs: &[(usize, usize)], masks: &Masks, surv: &mut Vec<u64>| {
+                let mut compact_at = SURV_COMPACT;
+                let mut drain = |jobs: &[(usize, usize)], masks: &Masks, surv: &mut Vec<u64>| {
                     for (i, &(row, g)) in jobs.iter().enumerate() {
                         // lanes that pass: the gate, or for a window holding its whole ORF the bar less
                         // SLACK, as that window already scores the whole diagonal to within rounding
@@ -1510,10 +1511,12 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             surv.push(pack(m, p.orf[q], c as u32, p.pos[q]));
                         }
                     }
-                    // a diagonal survives once per k-mer on it: compact before the list grows large
-                    if surv.len() > SURV_COMPACT {
+                    // a diagonal survives once per k-mer on it: compact before the list grows large. Again only when it
+                    // has doubled, or a tile with more than SURV_COMPACT unique diagonals sorts them at every batch
+                    if surv.len() > compact_at {
                         surv.sort_unstable();
                         surv.dedup();
+                        compact_at = SURV_COMPACT.max(2 * surv.len());
                     }
                 };
                 for code in 0..tile.starts.len() - 1 {
