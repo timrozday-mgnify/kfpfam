@@ -146,6 +146,8 @@ fn build(pf: &Pfam, shape: Shape, t_all: f32, out: &str) {
     f.write_all(&(total as u64).to_le_bytes()).unwrap();
     f.write_all(bytes_of(&starts)).unwrap();
     f.write_all(bytes_of(&entries)).unwrap();
+    // dropping a BufWriter ignores the last write's error: a full disk left a short index, read as garbage
+    f.flush().unwrap();
     eprintln!("built in {:.0}s", t0.elapsed().as_secs_f32());
 }
 
@@ -994,6 +996,7 @@ fn tile(pf: &Pfam, idx: &Index, out: &str) {
         f.write_all(bytes_of(&t.starts)).unwrap();
         f.write_all(bytes_of(&t.rows)).unwrap();
     }
+    f.flush().unwrap();
     eprintln!("{} tiles, {} entries", tiles.len(), tiles.iter().map(|t| t.rows.len()).sum::<usize>());
 }
 
@@ -1853,6 +1856,7 @@ fn seeds(pf: &Pfam, prep: &str, ga: &str, shapes: &[Shape], out: &str) {
     for r in &rows {
         f.write_all(bytes_of(r)).unwrap();
     }
+    f.flush().unwrap();
     eprintln!("{} models, {} shapes, {:.0} s", pf.models(), shapes.len(), t0.elapsed().as_secs_f32());
 }
 
