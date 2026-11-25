@@ -1,6 +1,8 @@
-"""Pfam-A.hmm.gz + clans to the arrays and model table every later step reads.
+"""An HMM file (Pfam-A, KOfam or any other) + clans to the arrays and model table every later step reads.
 
-Usage: prep.py Pfam-A.hmm.gz Pfam-A.clans.tsv.gz outdir
+Usage: prep.py HMMS[.gz] [CLANS.tsv[.gz] | -] outdir
+A model is named by its ACC (version dropped), or by its NAME where it has none, as KOfam's profiles do.
+GA, NSEQ and EFFN are optional (empty when absent), and so are the clans: '-' leaves that column empty.
 Writes profile.f32 (states x 21, log-odds bits, last column for unknown residues), offs.u32,
 accs.txt and models.tsv.
 """
@@ -17,9 +19,13 @@ Q = np.array([.0787945, .0151600, .0535222, .0668298, .0397062, .0695071, .02291
 Q /= Q.sum()
 
 
+def opener(path):
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)
+
+
 def parse(path):
     meta, rows, offs, m = [], [], [0], {}
-    with gzip.open(path, "rt") as f:
+    with opener(path) as f:
         for line in f:
             key = line[:5].strip()
             if key in ("NAME", "ACC", "LENG", "EFFN", "NSEQ", "GA"):
@@ -51,20 +57,22 @@ def main():
     table.tofile(out / "profile.f32")
     offs.tofile(out / "offs.u32")
     clan = {}
-    with gzip.open(clans, "rt") as f:
-        for line in f:
-            c = line.split("\t")
-            clan[c[0]] = c[1]
+    if clans != "-":
+        with opener(clans) as f:
+            for line in f:
+                c = line.split("\t")
+                if len(c) > 1:
+                    clan[c[0]] = c[1]
     with open(out / "models.tsv", "w") as o, open(out / "accs.txt", "w") as a:
         o.write("acc\tname\tclan\tlength\tga\tnseq\teffn\tmu\tlambda\tmean_info\ttop_info\t"
                 "conserved\n")
         for i, m in enumerate(meta):
-            acc = m["ACC"].split(".")[0]
+            acc = m.get("ACC", m["NAME"]).split(".")[0]
             r = rel[offs[i]:offs[i + 1]]
             top = np.convolve(r, np.ones(5), "valid").max() if len(r) >= 5 else r.sum()
             a.write(acc + "\n")
-            o.write(f"{acc}\t{m['NAME']}\t{clan.get(acc, '')}\t{m['LENG']}\t{m['GA']}\t{m['NSEQ']}"
-                    f"\t{m['EFFN']}\t{m['MU']}\t{m['LAMBDA']}\t{r.mean():.3f}\t{top:.2f}"
+            o.write(f"{acc}\t{m['NAME']}\t{clan.get(acc, '')}\t{m['LENG']}\t{m.get('GA', '')}"
+                    f"\t{m.get('NSEQ', '')}\t{m.get('EFFN', '')}\t{m['MU']}\t{m['LAMBDA']}\t{r.mean():.3f}\t{top:.2f}"
                     f"\t{(r >= 1).mean():.3f}\n")
     print(len(meta), "models,", len(table), "states")
 
