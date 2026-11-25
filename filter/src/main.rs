@@ -1038,7 +1038,7 @@ struct Postings {
     count: Vec<u32>,   // per k-mer, real postings
     windows: Vec<u8>,
     orf: Vec<u32>,
-    pos: Vec<u16>,
+    pos: Vec<u32>,
     covered: Vec<u64>, // per group, a mask of the lanes whose window holds the whole ORF
     span: Vec<(u8, u8)>, // per group, the window offsets that hold a residue in some lane
 }
@@ -1067,8 +1067,8 @@ fn postings(orfs: &[&[u8]], shape: Shape) -> Postings {
     for n in &per_orf {
         at.push(at.last().unwrap() + n);
     }
-    let mut all = vec![(0u32, 0u8, 0u8, 0u32, 0u16); *at.last().unwrap()];
-    let mut rest: &mut [(u32, u8, u8, u32, u16)] = &mut all;
+    let mut all = vec![(0u32, 0u8, 0u8, 0u32, 0u32); *at.last().unwrap()];
+    let mut rest: &mut [(u32, u8, u8, u32, u32)] = &mut all;
     let mut parts = Vec::with_capacity(orfs.len());
     for &n in &per_orf {
         let (head, tail) = std::mem::take(&mut rest).split_at_mut(n);
@@ -1080,7 +1080,7 @@ fn postings(orfs: &[&[u8]], shape: Shape) -> Postings {
         let mut i = 0;
         for j in 0..(f.len() + 1).saturating_sub(span) {
             if let Some(c) = code_at(f, j) {
-                out[i] = (c as u32, HALF.saturating_sub(j) as u8, (HALF + f.len() - j).min(WIN) as u8, o as u32, j as u16);
+                out[i] = (c as u32, HALF.saturating_sub(j) as u8, (HALF + f.len() - j).min(WIN) as u8, o as u32, j as u32);
                 i += 1;
             }
         }
@@ -1100,7 +1100,7 @@ fn postings(orfs: &[&[u8]], shape: Shape) -> Postings {
     for c in 0..space {
         group_code[gstarts[c] as usize..gstarts[c + 1] as usize].fill(c as u32);
     }
-    let (mut windows, mut orf, mut pos) = (vec![OUTSIDE + BIAS; groups * WIN * LANES], vec![u32::MAX; groups * LANES], vec![0u16; groups * LANES]);
+    let (mut windows, mut orf, mut pos) = (vec![OUTSIDE + BIAS; groups * WIN * LANES], vec![u32::MAX; groups * LANES], vec![0u32; groups * LANES]);
     let (mut covered, mut span) = (vec![0u64; groups], vec![(WIN as u8, 0u8); groups]);
     windows
         .par_chunks_mut(WIN * LANES)
@@ -1389,13 +1389,25 @@ fn diagonal(pf: &Pfam, m: usize, col: usize, f: &[u8], j: usize) -> f32 {
     best
 }
 
+// A survivor is model << 48 | ORF << 24 | diagonal key, so it sorts as one integer. The key is column less read position,
+// offset to stay positive.
+const KEY_BITS: u32 = 24;
+const KEY_OFFSET: u32 = 1 << (KEY_BITS - 1); // longest sequence, in residues
+const MAX_BLOCK: usize = 1 << (48 - KEY_BITS); // ORFs
+fn pack(model: u32, orf: u32, column: u32, pos: u32) -> u64 {
+    (model as u64) << 48 | (orf as u64) << KEY_BITS | (column + KEY_OFFSET - pos) as u64
+}
+/// Model, ORF, column less position.
+fn unpack(x: u64) -> (u32, u32, i64) {
+    ((x >> 48) as u32, (x >> KEY_BITS) as u32 & (MAX_BLOCK as u32 - 1), (x & (2 * KEY_OFFSET as u64 - 1)) as i64 - KEY_OFFSET as i64)
+}
+
 fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: usize, out: &str) {
     use std::io::BufRead;
     let mut lines = std::io::BufReader::with_capacity(1 << 20, fs::File::open(path).unwrap()).lines();
     let mut n_orfs = 0usize;
     let gate = (gate_bits * 4.0).round() as i8;
-    // a survivor is model << 48 | ORF << 17 | diagonal key, so it sorts as one integer
-    assert!(pf.models() < 1 << 16 && block < 1 << 31);
+    assert!(pf.models() < 1 << 16 && block <= MAX_BLOCK, "a block is at most {MAX_BLOCK} ORFs");
     // gapped score in a band of +-8 around the best diagonal (step 4); FILTER_BAND=b or =whole to change it. Up to
     // 16 has a SIMD bound ahead of it
     let band: Option<i64> = match std::env::var("FILTER_BAND").as_deref() { Ok("whole") => None, Ok(v) => Some(v.parse().unwrap()), Err(_) => Some(8) };
@@ -1451,6 +1463,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         }
         n_orfs += orfs.len();
         let chunk: Vec<&[u8]> = (0..orfs.len()).map(|i| orfs.seq(i)).collect();
+        assert!(chunk.iter().all(|f| f.len() <= KEY_OFFSET as usize), "a sequence is at most {KEY_OFFSET} residues");
         let t = Instant::now();
         let p = postings(&chunk, ti.shape);
         t_post += t.elapsed().as_secs_f64();
@@ -1494,9 +1507,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             let lane = mask.trailing_zeros() as usize / LANE_BITS;
                             mask &= !(LANE << (LANE_BITS * lane));
                             let q = g * LANES + lane;
-                            // diagonal key: column minus read position, offset to stay positive
-                            let key = (c as u32 + 65536) - p.pos[q] as u32;
-                            surv.push((m as u64) << 48 | (p.orf[q] as u64) << 17 | key as u64);
+                            surv.push(pack(m, p.orf[q], c as u32, p.pos[q]));
                         }
                     }
                     // a diagonal survives once per k-mer on it: compact before the list grows large
@@ -1559,10 +1570,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 unique.fetch_add(surv.len() as u64, Relaxed);
                 let mut res: Vec<(u32, u32, f32, i64)> = vec![];
                 for &x in surv.iter() {
-                    let (m, o, key) = ((x >> 48) as u32, (x >> 17) as u32 & 0x7fff_ffff, x as u32 & 0x1ffff);
+                    let (m, o, d) = unpack(x); // d: column - position
                     let f = chunk[o as usize];
                     let cols = (pf.offs[m as usize + 1] - pf.offs[m as usize]) as usize;
-                    let d = key as i64 - 65536; // column - position
                     // a point on the diagonal inside both the read and the model
                     let j = if d >= 0 { 0usize } else { (-d) as usize };
                     let col = (j as i64 + d) as usize;
@@ -2096,6 +2106,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn survivors_round_trip_in_sort_order() {
+        let mut all = vec![];
+        for m in [0, 1, 65_534] {
+            for o in [0, 7, MAX_BLOCK as u32 - 1] {
+                for (c, j) in [(0, KEY_OFFSET), (0, 65_536), (3, 3), (0, 0), (65_535, 0)] {
+                    let x = pack(m, o, c, j);
+                    assert_eq!(unpack(x), (m, o, c as i64 - j as i64));
+                    all.push((m, o, c as i64 - j as i64, x));
+                }
+            }
+        }
+        all.sort();
+        assert!(all.windows(2).all(|w| w[0].3 <= w[1].3));
+    }
+
+    /// The same domain at the start of a sequence, and past position 65,535 and 131,071: the same scores at every place.
+    #[test]
+    fn join_finds_a_domain_wherever_it_is() {
+        let dir = std::env::temp_dir().join(format!("kfpfam-long-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let n = 60usize;
+        let lo: Vec<f32> = (0..n * 21).map(|i| if i % 21 == (i / 21) * 7 % 20 { 4.0 } else { -2.0 }).collect();
+        fs::write(path("profile.f32"), bytes_of(&lo)).unwrap();
+        fs::write(path("offs.u32"), bytes_of(&[0u32, n as u32])).unwrap();
+        let pf = Pfam::load(dir.to_str().unwrap());
+        build(&pf, Shape::parse("4"), 7.0, &path("i.idx"));
+        tile(&pf, &load_index(&path("i.idx")), &path("i.tidx"));
+        let domain: String = (0..n).map(|c| A[c * 7 % 20] as char).collect();
+        // filler of one residue, which scores -2 nearly everywhere and is in no word
+        let at = [0usize, 100, 65_500, 65_536, 70_000, 140_000, 300_000];
+        let faa: String = at.iter().map(|&j| format!(">at{j}\n{}{domain}{}\n", "W".repeat(j), "W".repeat(30))).collect();
+        fs::write(path("p.faa"), faa).unwrap();
+        join(&pf, &load_tiles(&path("i.tidx")), &path("p.faa"), 17.0, 16.5, 100, &path("out.tsv"));
+        let out = fs::read_to_string(path("out.tsv")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        let rows: Vec<Vec<&str>> = out.lines().map(|l| l.split('\t').collect()).collect();
+        assert_eq!(rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>(), at.map(|j| format!("at{j}")).to_vec());
+        assert!(rows.iter().all(|r| r[1..] == rows[0][1..]), "{out}");
     }
 
     #[test]
