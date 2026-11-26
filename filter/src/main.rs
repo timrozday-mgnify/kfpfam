@@ -1456,6 +1456,14 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     // FILTER_BINARY=1: per block its ORFs, residues and bytes of pairs (u64), then the pairs, (ORF in the block, model) as
     // two u32 in model order, little endian. For a reader that streams the same FASTA beside it: 8 bytes a pair, not 60
     let binary = std::env::var("FILTER_BINARY").is_ok_and(|v| v == "1");
+    // FILTER_PER_ORF=path: a diagnostic, each ORF's work (see PerOrf). Off, nothing is counted or timed
+    let mut per_orf = std::env::var("FILTER_PER_ORF").ok().map(|p| {
+        let mut f = std::io::BufWriter::new(fs::File::create(p).unwrap());
+        use std::io::Write;
+        writeln!(f, "orf\tname\tlength\thits\tsurvivors\tdiagonals\tdiagonal_ns\tbounded\tbound_ns\tgapped\tgapped_ns\twritten").unwrap();
+        f
+    });
+    let timer_ns = if per_orf.is_some() { timer_cost() } else { 0.0 };
     let mut sink = std::io::BufWriter::new(fs::File::create(out).unwrap());
     let threads = rayon::current_num_threads() as f64;
     let t0 = Instant::now();
@@ -1476,9 +1484,11 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         let t = Instant::now();
         // each tile's pairs are scored and formatted before the next tile's are found, so a block holds its
         // text, not its pairs
-        let rows: Vec<Vec<u8>> = ti.tiles
+        let on = per_orf.is_some();
+        let rows: Vec<(Vec<u8>, Vec<PerOrf>)> = ti.tiles
             .par_iter()
             .map_init(|| (Vec::<i8>::new(), Vec::<u64>::new(), vec![], vec![]), |(prof, surv, h, del), tile| {
+                let mut work = if on { vec![PerOrf::default(); chunk.len()] } else { vec![] };
                 let base = tile_bases(pf, tile.m0, tile.m1);
                 prof.clear();
                 for m in tile.m0..tile.m1 {
@@ -1512,6 +1522,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             mask &= !(LANE << (LANE_BITS * lane));
                             let q = g * LANES + lane;
                             surv.push(pack(m, p.orf[q], c as u32, p.pos[q]));
+                            if on {
+                                work[p.orf[q] as usize].survivors += 1;
+                            }
                         }
                     }
                     // a diagonal survives once per k-mer on it: compact before the list grows large. Again only when it
@@ -1585,7 +1598,13 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                     if j >= f.len() || col >= cols {
                         continue;
                     }
+                    let td = on.then(Instant::now);
                     let s = diagonal(pf, m as usize, col, f, j);
+                    if let Some(td) = td {
+                        let w = &mut work[o as usize];
+                        w.diagonals += 1;
+                        w.diagonal_ns += (td.elapsed().as_nanos() as f64 - timer_ns).max(0.0);
+                    }
                     if s >= bar {
                         match res.last_mut() {
                             Some(x) if !all_diagonals && x.0 == o && x.1 == m => {
@@ -1614,6 +1633,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                     }
                 };
                 for four in res.chunks(PAIRS) {
+                    let tb = on.then(Instant::now);
                     let reach = bound.as_ref().map_or([true; PAIRS], |b| {
                         // a short last chunk repeats its first pair
                         b.may_reach(std::array::from_fn(|i| {
@@ -1621,6 +1641,13 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             (m as usize, chunk[o as usize], diag)
                         }))
                     });
+                    if let Some(tb) = tb {
+                        let share = (tb.elapsed().as_nanos() as f64 - timer_ns).max(0.0) / four.len() as f64;
+                        for &(o, ..) in four {
+                            work[o as usize].bounded += 1;
+                            work[o as usize].bound_ns += share;
+                        }
+                    }
                     for (&(o, m, d, diag), _) in four.iter().zip(reach).filter(|(_, r)| *r) {
                         if first_only && pending.is_some_and(|p| p.0 == o && p.1 == m) {
                             continue;
@@ -1629,11 +1656,19 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         n += 1;
                         let a = pf.offs[m as usize] as usize;
                         let cols = pf.offs[m as usize + 1] as usize - a;
+                        let te = on.then(Instant::now);
                         let g = match band {
                             Some(b) => gapped_band(&pf.lo, a, cols, f, diag, b, h, del),
                             None => gapped(&pf.lo, a, cols, f, h, del),
                         };
+                        if let Some(te) = te {
+                            work[o as usize].gapped += 1;
+                            work[o as usize].gapped_ns += (te.elapsed().as_nanos() as f64 - timer_ns).max(0.0);
+                        }
                         if g >= min_gapped[m as usize] {
+                            if on && !pending.is_some_and(|p| p.0 == o && p.1 == m) {
+                                work[o as usize].written += 1;
+                            }
                             match &mut pending {
                                 Some(p) if p.0 == o && p.1 == m => (p.2, p.3) = (p.2.max(d), p.3.max(g)),
                                 _ => write(&mut text, pending.replace((o, m, d, g))),
@@ -1645,16 +1680,19 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 bounded.fetch_add(n, Relaxed);
                 pairs_n.fetch_add(res.len() as u64, Relaxed);
                 gap_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
-                text
+                (text, work)
             })
             .collect();
         t_join += t.elapsed().as_secs_f64();
+        if let Some(f) = per_orf.as_mut() {
+            write_per_orf(f, &orfs, &chunk, &p, ti, &dropped, &rows, n_orfs - orfs.len());
+        }
         if binary {
-            for x in [orfs.len(), orfs.seqs.len(), rows.iter().map(Vec::len).sum()] {
+            for x in [orfs.len(), orfs.seqs.len(), rows.iter().map(|r| r.0.len()).sum()] {
                 sink.write_all(&(x as u64).to_le_bytes()).unwrap();
             }
         }
-        for r in rows {
+        for (r, _) in rows {
             sink.write_all(&r).unwrap();
         }
         if binary {
@@ -1663,6 +1701,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         }
     }
     sink.flush().unwrap();
+    if let Some(mut f) = per_orf {
+        f.flush().unwrap();
+    }
     let wall = t0.elapsed().as_secs_f64();
     let h = hits.load(Relaxed) as f64;
     let (surv_s, gap_s) = (surv_ns.load(Relaxed) as f64 / 1e9, gap_ns.load(Relaxed) as f64 / 1e9);
@@ -1673,6 +1714,68 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         n_orfs, wall, wall * threads, t_post, join_s, gap_s,
         h as u64, join_s * 1e9 / h.max(1.0), survivors.load(Relaxed), survivors.load(Relaxed) as f64 / h.max(1.0), unique.load(Relaxed), surv_s, pairs_n.load(Relaxed), bounded.load(Relaxed)
     );
+}
+
+/// One ORF's work in `join`, for FILTER_PER_ORF. Counts: survivors of the gate (k-mer hits kept), diagonals scored
+/// whole, pairs through the SIMD bound and through the exact gapped score, pairs written. Times in core-ns, less
+/// the timer's own cost; the bound scores PAIRS pairs at once, and each gets an equal share. The gate is not timed:
+/// its cost per k-mer hit hardly varies, so a reader shares the log's gate time out by `hits`, and the sort's by
+/// `survivors`.
+#[derive(Clone, Default)]
+struct PerOrf {
+    survivors: u64,
+    diagonals: u64,
+    diagonal_ns: f64,
+    bounded: u64,
+    bound_ns: f64,
+    gapped: u64,
+    gapped_ns: f64,
+    written: u64,
+}
+
+/// The cost of one Instant::now and elapsed pair, in ns.
+fn timer_cost() -> f64 {
+    let n = 100_000;
+    let t = Instant::now();
+    let mut x = 0u128;
+    for _ in 0..n {
+        x += std::hint::black_box(Instant::now()).elapsed().as_nanos();
+    }
+    std::hint::black_box(x);
+    t.elapsed().as_nanos() as f64 / n as f64
+}
+
+/// A block's rows of FILTER_PER_ORF: the tiles' work summed, and each ORF's k-mer hits, as the join counts them.
+#[allow(clippy::too_many_arguments)]
+fn write_per_orf(f: &mut impl std::io::Write, orfs: &Packed, chunk: &[&[u8]], p: &Postings, ti: &TileIndex, dropped: &[bool],
+    rows: &[(Vec<u8>, Vec<PerOrf>)], first: usize) {
+    let mut hits = vec![0u64; chunk.len()];
+    for code in 0..ti.tiles[0].starts.len() - 1 {
+        let n: u64 = ti.tiles.iter().map(|t| (t.starts[code + 1] - t.starts[code]) as u64).sum();
+        if n == 0 || dropped[code] {
+            continue;
+        }
+        let (g0, count) = (p.gstarts[code] as usize, p.count[code] as usize);
+        for q in g0 * LANES..g0 * LANES + count {
+            hits[p.orf[q] as usize] += n;
+        }
+    }
+    for i in 0..chunk.len() {
+        let mut w = PerOrf::default();
+        for (_, t) in rows {
+            let x = &t[i];
+            w.survivors += x.survivors;
+            w.diagonals += x.diagonals;
+            w.diagonal_ns += x.diagonal_ns;
+            w.bounded += x.bounded;
+            w.bound_ns += x.bound_ns;
+            w.gapped += x.gapped;
+            w.gapped_ns += x.gapped_ns;
+            w.written += x.written;
+        }
+        writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{}\t{:.0}\t{}\t{:.0}\t{}", first + i, orfs.name(i), chunk[i].len(), hits[i],
+            w.survivors, w.diagonals, w.diagonal_ns, w.bounded, w.bound_ns, w.gapped, w.gapped_ns, w.written).unwrap();
+    }
 }
 
 // What a seed would do at each threshold, model by model, from the HMM alone.
