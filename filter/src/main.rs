@@ -1981,7 +1981,14 @@ mod tests {
         let mut f: Vec<u8> = (0..n as u8).map(|c| c % 20).collect();
         f[15] = 20;
         let want = 1.0 * (n - 1) as f32 + (Q[15] * 1.5 / Q.iter().sum::<f64>() - 0.5) as f32;
-        assert!((diagonal(&pf, 0, 0, &f, 0) - want).abs() < 1e-3);
+        let (s, from, to) = diagonal_segment(&pf, 0, 0, &f, 0);
+        assert!((s - want).abs() < 1e-3 && (from, to) == (0, n));
+        // the best segment of a diagonal is where the score runs: after a stretch that loses, not before
+        let mut g = f.clone();
+        g[..5].fill(19);
+        g[10] = 13; // costs 0.5: the segment runs through it
+        let (_, from, to) = diagonal_segment(&pf, 0, 0, &g, 0);
+        assert_eq!((from, to), (5, n));
         assert!((gapped(&pf.lo, 0, n, &f, &mut vec![], &mut vec![]) - want).abs() < 1e-3);
         // the window of the word at 0 holds 26 residues and padding before them: in quarter bits 25 x 4 - 2 through
         // the X, and 15 x 4 if it broke the run
