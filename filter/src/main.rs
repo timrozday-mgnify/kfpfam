@@ -1405,7 +1405,17 @@ fn unpack(x: u64) -> (u32, u32, i64) {
     ((x >> 48) as u32, (x >> KEY_BITS) as u32 & (MAX_BLOCK as u32 - 1), (x & (2 * KEY_OFFSET as u64 - 1)) as i64 - KEY_OFFSET as i64)
 }
 
+/// FILTER_PER_ORF's checks sit in the join's inner loops, so the join is compiled with and without them.
 fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: usize, out: &str) {
+    match std::env::var("FILTER_PER_ORF") {
+        Ok(p) => join_with::<true>(pf, ti, path, bar, gate_bits, block, out, Some(p)),
+        Err(_) => join_with::<false>(pf, ti, path, bar, gate_bits, block, out, None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_with<const PER_ORF: bool>(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: usize, out: &str,
+    per_orf: Option<String>) {
     use std::io::BufRead;
     let mut lines = std::io::BufReader::with_capacity(1 << 20, fs::File::open(path).unwrap()).lines();
     let mut n_orfs = 0usize;
@@ -1457,10 +1467,10 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     // two u32 in model order, little endian. For a reader that streams the same FASTA beside it: 8 bytes a pair, not 60
     let binary = std::env::var("FILTER_BINARY").is_ok_and(|v| v == "1");
     // FILTER_PER_ORF=path: a diagnostic, each ORF's work (see PerOrf). Off, nothing is counted or timed
-    let mut per_orf = std::env::var("FILTER_PER_ORF").ok().map(|p| {
+    let mut per_orf = per_orf.map(|p| {
         let mut f = std::io::BufWriter::new(fs::File::create(p).unwrap());
         use std::io::Write;
-        writeln!(f, "orf\tname\tlength\thits\tsurvivors\tdiagonals\tdiagonal_ns\tbounded\tbound_ns\tgapped\tgapped_ns\twritten").unwrap();
+        writeln!(f, "orf\tname\tlength\thits\tdiagonals\tdiagonal_ns\tbounded\tbound_ns\tgapped\tgapped_ns\twritten").unwrap();
         f
     });
     let timer_ns = if per_orf.is_some() { timer_cost() } else { 0.0 };
@@ -1484,7 +1494,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         let t = Instant::now();
         // each tile's pairs are scored and formatted before the next tile's are found, so a block holds its
         // text, not its pairs
-        let on = per_orf.is_some();
+        let on = PER_ORF;
         let rows: Vec<(Vec<u8>, Vec<PerOrf>)> = ti.tiles
             .par_iter()
             .map_init(|| (Vec::<i8>::new(), Vec::<u64>::new(), vec![], vec![]), |(prof, surv, h, del), tile| {
@@ -1522,9 +1532,6 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             mask &= !(LANE << (LANE_BITS * lane));
                             let q = g * LANES + lane;
                             surv.push(pack(m, p.orf[q], c as u32, p.pos[q]));
-                            if on {
-                                work[p.orf[q] as usize].survivors += 1;
-                            }
                         }
                     }
                     // a diagonal survives once per k-mer on it: compact before the list grows large. Again only when it
@@ -1716,14 +1723,13 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     );
 }
 
-/// One ORF's work in `join`, for FILTER_PER_ORF. Counts: survivors of the gate (k-mer hits kept), diagonals scored
-/// whole, pairs through the SIMD bound and through the exact gapped score, pairs written. Times in core-ns, less
-/// the timer's own cost; the bound scores PAIRS pairs at once, and each gets an equal share. The gate is not timed:
-/// its cost per k-mer hit hardly varies, so a reader shares the log's gate time out by `hits`, and the sort's by
-/// `survivors`.
+/// One ORF's work in `join`, for FILTER_PER_ORF. Counts: diagonals scored whole (the gate's survivors, deduplicated),
+/// pairs through the SIMD bound and through the exact gapped score, pairs written. Times in core-ns, less the timer's
+/// own cost; the bound scores PAIRS pairs at once, and each gets an equal share. The gate and the survivors' sort are
+/// not timed, as that would slow the gate's loop even when this is off: their cost per k-mer hit hardly varies, so a
+/// reader shares the log's gate time out by `hits`, and the sort's by `diagonals`.
 #[derive(Clone, Default)]
 struct PerOrf {
-    survivors: u64,
     diagonals: u64,
     diagonal_ns: f64,
     bounded: u64,
@@ -1764,7 +1770,6 @@ fn write_per_orf(f: &mut impl std::io::Write, orfs: &Packed, chunk: &[&[u8]], p:
         let mut w = PerOrf::default();
         for (_, t) in rows {
             let x = &t[i];
-            w.survivors += x.survivors;
             w.diagonals += x.diagonals;
             w.diagonal_ns += x.diagonal_ns;
             w.bounded += x.bounded;
@@ -1773,8 +1778,8 @@ fn write_per_orf(f: &mut impl std::io::Write, orfs: &Packed, chunk: &[&[u8]], p:
             w.gapped_ns += x.gapped_ns;
             w.written += x.written;
         }
-        writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{}\t{:.0}\t{}\t{:.0}\t{}", first + i, orfs.name(i), chunk[i].len(), hits[i],
-            w.survivors, w.diagonals, w.diagonal_ns, w.bounded, w.bound_ns, w.gapped, w.gapped_ns, w.written).unwrap();
+        writeln!(f, "{}\t{}\t{}\t{}\t{}\t{:.0}\t{}\t{:.0}\t{}\t{:.0}\t{}", first + i, orfs.name(i), chunk[i].len(), hits[i],
+            w.diagonals, w.diagonal_ns, w.bounded, w.bound_ns, w.gapped, w.gapped_ns, w.written).unwrap();
     }
 }
 

@@ -579,3 +579,8 @@ default does not load. The sections above stand as the record of what whole prot
 
 Short models are the other side of this: the filter's cost follows the shorter of query and model, and a model of 50 columns
 or fewer has no region to choose, so short families such as weefams suit it as they are.
+
+`FILTER_PER_ORF=path` (028b1e6 and after) writes each ORF's work for profiling cost per query: its k-mer hits, and
+counts and core-ns of the diagonal, bound and exact gapped stages; the gate's time is shared out by hits and the sort's
+by diagonals, as timing the gate's loop would slow it. The join is compiled with and without it: off, read ORFs take
+22.5 CPU-s against 75e543d's 22.3 (three runs each, the same pairs), on 4.6% more.
