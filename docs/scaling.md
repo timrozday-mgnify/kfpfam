@@ -467,3 +467,115 @@ tiles, the same proteins; total is filter and HMMER (`--forward-slack 8`), CPU-s
 reads it from them, so one binary serves both. A 32:12 index gives the pairs of a build with `WIN` 32, byte for byte, and a
 default one those of before. `top` in hmm-annotate is 32:12 with `FILTER_DIAG_WINDOW=8` and `FILTER_GAPPED_WINDOW=64`
 (on 50-residue pieces too, 0 of 11,835 pairs lost, 22.1 → 18.5 CPU-s for the filter).
+
+### Models trimmed to 50 columns, and where `top`'s time goes now (2026-11-26)
+
+The same 24,000 proteins and 7,534 models; `top` at 32:12, 8, 64; `hmmsearch` 176 CPU-s; HMMER with `--forward-slack 8`;
+8,723 pairs to find. Each stage, what reaches it, and its CPU-s:
+
+| stage | in | CPU-s |
+| --- | ---: | ---: |
+| window gate | 11.2 G k-mer hits | 13.6 |
+| survivors sorted, whole diagonals | 85.0 M survivors, 36.1 M diagonals | 1.6 + 3.5 |
+| gapped bound | 18.7 M pairs at the diagonal bar | 11.5 |
+| gapped exact | 1.64 M past the bound | 6.0 |
+| HMMER MSV | 752 k pairs written | 4.2 |
+| HMMER bias filter and Viterbi | MSV's passes | 12.9 |
+| HMMER Forward | Viterbi's | 9.9 |
+| HMMER domain definition | 12.7 k within 8 bits | 7.6 |
+
+69 CPU-s, 2.5× `hmmsearch`, 3 missed. The false pairs sit on the chance tail just over the bar (median gapped score
+22.8 at a bar of 21.25), about half as many for each 1.75 bits more.
+
+**One 50-column stretch per model** (the 50 with the highest summed best log-odds; models of 75 or fewer whole; parent T and
+bars). A stand-in for a real choice of trim. 1.21 M columns become 0.38 M, index entries 348 M → 136 M; filter 10.3 CPU-s
+(gate 6.5), HMMER 13.3 on 217 k pairs, 23.6 in all (7.5×), but 1,360 pairs missed. By how much of the stretch the true domain
+covers: none, 629 of 630 missed; under half, 291 of 528; half to 80%, 92 of 759; 80-99%, 81 of 1,448; all of it, 267 of 5,358.
+The last are weak domains whose 50 columns score 10-21 in the filter, under its bar. Choosing each model's stretch with
+hindsight, to cover the most of these very pairs, still leaves 331 pairs that overlap it by fewer than 10 columns, 600 by fewer
+than 25: MGnify's hits are often part of a domain, at different places. One stretch per model cannot keep `top`'s recall;
+pieces covering the model can, and cost what the windows above cost.
+
+**A second gapped bar on the whole diagonal** (`FILTER_SECOND_GAPPED=s`, uncommitted; not for the repeat models of
+`FILTER_GAPPED_FILE`). The windows lower the weakest true pairs' scores (best of their diagonals: 22.7 at the least; on the
+whole diagonal's band, 26.4), so a pair that passes the window is scored again over its whole diagonal and needs s there:
+
+| | filter | pairs to HMMER | HMMER | total | × `hmmsearch` | missed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `top` | 34.6 | 752 k | 34.6 | 69.2 | 2.5 | 3 |
+| s 24 | 42 | 253 k | 20.3 | 62 | 2.8 | 4 |
+| s 25 | 43 | 183 k | 16.9 | 60 | 2.9 | 4 |
+| s 26 | 43 | 139 k | 14.3 | 57 | 3.1 | 4 |
+| s 25, θ 8 | 38 | 177 k | 16.5 | 55 | 3.2 | 6 |
+| s 25, θ 7 | 34 | 170 k | 16.3 | 50 | 3.5 | 7 |
+| s 25, diagonal bar 16 | 34 | 163 k | 16.3 | 50 | 3.5 | 9 |
+| s 25, diagonal bar 17 | 29 | 142 k | 15.6 | 45 | 3.9 | 13 |
+
+HMMER halves for a quarter of the pairs: the pairs left are the longer proteins (false ones 534 residues on average).
+
+**Cheaper HMMER, tried and dropped.** A Viterbi filter set like `--forward-slack` (a P-value that stops a protein 12 bits
+under the threshold) saves 12 CPU-s and misses 182 more pairs: Viterbi is far under the final score for weak, gapped
+domains. HMMER first on a window of the protein (the diagonals' stretch of the model, 20 or 40 residues more each side; then
+the whole protein for those within 8 bits) reads a third of the residues, but costs 24.8 against 34.6 and misses 455
+(repeats: EGF, cadherin, whose copies add up outside the window). On the second bar's pairs it saves 2.4 CPU-s.
+
+**Floors.** The gate alone is 13.6 CPU-s, 13× `hmmsearch` if all else were free; HMMER on the true pairs alone, 3 CPU-s. 10×
+needs the gate's 11 G hits made several times cheaper or fewer, which lower θ does only by missing pairs.
+
+### How concentrated a model's evidence is (2026-11-26)
+
+Per domain, the filter's scores along HMMER's alignment (match log-odds; gaps 6, and 1 a residue more) give the best local
+score inside any w columns, a lower bound on what a model cut to those columns scores. Pfam 38.2's 412,351 seed domains
+at GA, and the slice's 11,622 true domains (8,723 pairs); bar 21.25.
+
+- **Each domain is concentrated.** For all but 368, 107, 34 and 2 of 8,723 pairs some 20, 30, 50 or 75 columns alone
+  reach the bar; their best 50 columns hold a median 75% of the domain's score (10th percentile 46%).
+- **But not in the same place.** Regions chosen on the seeds alone (each disjoint from the last, up to four) miss many:
+  one of 50 columns keeps 6,358 pairs, four keep 8,271. Seed domains are strong and whole; MGnify's are weak and partial.
+- **Regions chosen on the slice's other half** (with the seeds; greedy set cover, overlapping allowed, a training domain
+  must clear the bar by a margin where it can), tested on the held-out half:
+
+| w | margin | regions a model | columns | test pairs lost | of which no w columns can keep |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 30 | 0 | 1.13 | 0.21 | 108 of 4,055 | 53 |
+| 30 | 4 | 1.22 | 0.23 | 79 | 53 |
+| 50 | 0 | 1.07 | 0.32 | 61 of 3,515 | 14 |
+| 50 | 8 | 1.13 | 0.34 | 40 | 14 |
+| 50 | 12 | 1.17 | 0.35 | 37 | 14 |
+
+(test pairs of models longer than w; shorter models stay whole.)
+
+The filter with those regions as models (parent T and bars), HMMER on the whole proteins against the whole models:
+
+| | pieces | columns | filter | HMMER | total | × `hmmsearch` | missed, all | missed, held-out half |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `top` | 7,534 | 1.21 M | 34.6 | 34.6 | 69 | 2.5 | 3 | |
+| 50 columns, margin 8 | 8,400 | 0.41 M | 11 | 14.1 | 25 | 7.0 | 64 | 34 of 4,307 |
+| 75 columns, margin 8 | 7,957 | 0.56 M | 16 | 18.7 | 35 | 5.1 | 25 | 16 of 4,307 |
+
+Of the held-out misses, about 40% have no region of that width at all (weak domains spread over the model) and the rest
+want a region the training half never showed. More training proteins would shrink the second part, not the first.
+
+### Back to the reads' filter (2026-11-26)
+
+kfpfam's use is short reads; MGnify proteins are annotated with `hmmsearch`, and `top` on them stays as a benchmark of the
+method (its misses show where recall goes). On 309,149 read ORFs of ERR10889147 (9.3 M residues, the same 7,534 models,
+`hmmsearch` 357 CPU-s, 2,142 pairs), `top`'s read settings, filter CPU-s (two runs each), all pairs found in every row:
+
+| filter | CPU-s |
+| --- | ---: |
+| 210c93c, before the whole-protein work | 22.4 |
+| 7a6cce4: u32 positions, survivors compacted again only when doubled, writes checked | 22.3 |
+| c69307e: stage timers, `FILTER_GAPPED_WINDOW` (off) | 26.2 |
+| cdaa97e: u128 survivors, `FILTER_DIAG_WINDOW` (off) | 27.1 |
+| 63a4cf6: the gate's window from the tiles | 27.4 |
+| 63a4cf6 with 32:12, 8, 64 | 22.1 |
+| 63a4cf6 with 48:22, 8, 64 | 25.7 |
+
+The windows only won back what their own code cost on reads, so the filter is 7a6cce4's again: the window options,
+`FILTER_WINDOW` and the stage timers are gone (63a4cf6 has them), and an index tiled with `FILTER_WINDOW` other than the
+default does not load. The sections above stand as the record of what whole proteins need. `--forward-slack 8` in HMMER
+(hm-annotate) does help reads: 4.14 → 3.37 CPU-s, nothing lost.
+
+Short models are the other side of this: the filter's cost follows the shorter of query and model, and a model of 50 columns
+or fewer has no region to choose, so short families such as weefams suit it as they are.
