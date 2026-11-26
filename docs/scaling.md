@@ -419,3 +419,20 @@ sharper test than one over the whole diagonal, which can collect chance segments
 together, 128 → 79 CPU-s, with no pair lost; on these proteins that is 2.3× `hmmsearch` (179) where it was 1.4×. `fast`'s
 diagonals were cheap already: 32 and whole is free (69 lost, as before), 32 and 64 saves a little more for 8 pairs.
 What is left of `top`'s filter is the window gate itself, 17-18 CPU-s of 41.5.
+
+### Long queries or long models? (2026-11-26)
+
+The same 7,534 models cut into 24,367 pieces of 50 columns (25 to 74; T and a flat gapped bar of 21.25 from the parent; a
+timing test only, as pieces have no thresholds), `top`'s settings, whole diagonals and bands, filter CPU-s:
+
+| | models whole (median 121 columns) | models cut to 50 |
+| --- | ---: | ---: |
+| 50-residue queries | 25.8 (diagonal 161 ns, bound 0.24 µs) | 20.7 (140 ns, 0.25 µs) |
+| whole proteins (median 191) | 89.1 (427 ns, 1.13 µs) | 31.8 (145 ns, 0.40 µs) |
+
+The diagonal and gapped stages cost what the overlap of query and model costs, the shorter of the two, so shortening either one
+brings them back: whole proteins against 50-column models cost 1.2× what 50-residue pieces do, not 3.5×. The windows of the
+sections above do the same without cutting anything (41.5). HMMER is different: a candidate's Forward, Backward and domain
+definition run over the whole query whatever the model, and `hmmsearch` pays for every column too, so model length cancels
+out of HMMER's speed-up and query length does not (`fast`: 56 µs a candidate on 50-residue pieces, 171 on whole proteins,
+for about as many candidates).
