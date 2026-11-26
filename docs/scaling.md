@@ -436,3 +436,29 @@ sections above do the same without cutting anything (41.5). HMMER is different: 
 definition run over the whole query whatever the model, and `hmmsearch` pays for every column too, so model length cancels
 out of HMMER's speed-up and query length does not (`fast`: 56 µs a candidate on 50-residue pieces, 171 on whole proteins,
 for about as many candidates).
+
+### One windowed score or two? (2026-11-26)
+
+With `FILTER_DIAG_WINDOW=8` a diagonal of one k-mer is scored on 24 residues, inside the gate's 48, so the gate's outer residues
+only decide which hits reach a test that no longer looks at them. Builds with `WIN` 32 (`HALF` 12) and 24 (`HALF` 8), their own
+tiles, the same proteins; total is filter and HMMER (`--forward-slack 8`), CPU-s, pairs missed of 8,723:
+
+| mode | gate window | gate | diagonal, gapped windows | gate CPU-s | diagonals | at the bar | filter | total | missed |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `top` | 48 | 14.5 | 8, 64 | 17.3 | 44.2 M | 20.4 M | 41.4 | 78.4 | 0 |
+| `top` | 32 | 14.5 | 8, 64 | 14.2 | 36.1 M | 18.7 M | 33.7 | 68.9 | 3 |
+| `top` | 24 | 14.5 | 8, 64 | 12.8 | 28.5 M | 17.8 M | 29.4 | 63.6 | 5 |
+| `top` | 24 | 14 | 8, 64 | 15.1 | 40.9 M | 17.9 M | 32.7 | 67.0 | 5 |
+| `top` | 24 | 14.5 | 0, 64 | 11.4 | 28.5 M | 7.3 M | 18.5 | 43.6 | 64 |
+| `fast` | 48 | 17.5 | 32, 64 | 4.0 | 4.7 M | 3.26 M | 7.9 | 17.3 | 77 |
+| `fast` | 32 | 16.5 | 32, 64 | 3.5 | 6.9 M | 2.72 M | 6.8 | 16.0 | 101 |
+| `fast` | 24 | 17.5 | 32, 64 | 3.0 | 2.5 M | 1.79 M | 4.5 | 13.2 | 207 |
+
+- The gate costs 0.74× at half the window, not 0.5×: its 11.2 G hits each cost something whatever the window.
+- A narrower gate is also a stricter one (fewer survivors), and the few pairs it loses do not come back with a lower gate,
+  which only lets more through (14 against 14.5 costs 3.3 CPU-s and keeps the same 5 lost).
+- Merging the two into one stage would cost more, not less. The gate is int8, per hit, in SIMD; the diagonal is exact f32, once
+  per diagonal (0.25-0.4% of hits) and over every k-mer on it; it halves what reaches the bound (44 → 20 M diagonals at the bar).
+  Without it the bound would see every survivor, and int8 rounding alone moved 5% of pairs across the bar before.
+- So two stages stay, with a narrower gate as a choice: `top` 32 is 0.88× its CPU for 3 pairs (0.03%), 24 is 0.81× for 5.
+  `WIN` is a constant of the postings' layout and the tiles: as an option it would need the tiles built for it.
