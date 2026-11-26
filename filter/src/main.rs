@@ -925,8 +925,22 @@ fn window(pf: &Pfam, idx: &Index, path: &str, bar: f32, out: &str) {
 
 // ---- Speed plan step 2: join from the model's side ----
 
-const WIN: usize = 48; // residues per posting, the k-mer at HALF..HALF + k
-const HALF: usize = 22;
+/// Residues per posting, and where the k-mer is in them (HALF..HALF + k): 48 and 22 unless the index was tiled with
+/// FILTER_WINDOW=len:half. Set once, by `tile` or by reading the tiles, before anything uses it.
+static WINDOW: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+const DEFAULT_WINDOW: (usize, usize) = (48, 22);
+#[inline(always)]
+fn win() -> usize {
+    WINDOW.get_or_init(|| DEFAULT_WINDOW).0
+}
+#[inline(always)]
+fn half() -> usize {
+    WINDOW.get_or_init(|| DEFAULT_WINDOW).1
+}
+fn set_window(w: (usize, usize)) {
+    assert!(w.1 + 16 <= w.0 && w.0 <= 64, "FILTER_WINDOW {}:{}: the word must fit, and at most 64", w.0, w.1);
+    assert_eq!(*WINDOW.get_or_init(|| w), w, "one window per process");
+}
 const STRIDE: usize = 32; // bytes per profile column: 21 residues, X the last, then padding
 const OUTSIDE: u8 = 21; // a window's residue outside its ORF, in the column's padding
 
@@ -952,16 +966,21 @@ struct TileIndex {
 fn tile_bases(pf: &Pfam, m0: usize, m1: usize) -> Vec<usize> {
     let mut base = vec![0usize; m1 - m0 + 1];
     for m in m0..m1 {
-        base[m - m0 + 1] = base[m - m0] + (pf.offs[m + 1] - pf.offs[m]) as usize + WIN;
+        base[m - m0 + 1] = base[m - m0] + (pf.offs[m + 1] - pf.offs[m]) as usize + win();
     }
     base
 }
 
 fn tile(pf: &Pfam, idx: &Index, out: &str) {
+    // FILTER_WINDOW=len:half, the window gate's residues; the tiles are laid out for it, and join reads it from them
+    if let Ok(v) = std::env::var("FILTER_WINDOW") {
+        let (len, half) = v.split_once(':').expect("FILTER_WINDOW=len:half, say 32:12");
+        set_window((len.parse().unwrap(), half.parse().unwrap()));
+    }
     let mut bounds = vec![0usize];
     let mut rows_in = 0usize;
     for m in 0..pf.models() {
-        let rows_m = (pf.offs[m + 1] - pf.offs[m]) as usize + WIN;
+        let rows_m = (pf.offs[m + 1] - pf.offs[m]) as usize + win();
         assert!(rows_m <= TILE_ROWS);
         if rows_in + rows_m > TILE_ROWS {
             bounds.push(m);
@@ -990,14 +1009,16 @@ fn tile(pf: &Pfam, idx: &Index, out: &str) {
         Tile { m0, m1, starts, rows }
     }).collect();
     let mut f = std::io::BufWriter::new(fs::File::create(out).unwrap());
-    f.write_all(bytes_of(&[idx.shape.header(), tiles.len() as u64])).unwrap();
+    // the window in the tile count's high bits: an index from before has none there, and the window it was laid out for
+    let window = if (win(), half()) == DEFAULT_WINDOW { 0 } else { (win() as u64) << 32 | (half() as u64) << 48 };
+    f.write_all(bytes_of(&[idx.shape.header(), tiles.len() as u64 | window])).unwrap();
     for t in &tiles {
         f.write_all(bytes_of(&[t.m0 as u64, t.m1 as u64, t.rows.len() as u64])).unwrap();
         f.write_all(bytes_of(&t.starts)).unwrap();
         f.write_all(bytes_of(&t.rows)).unwrap();
     }
     f.flush().unwrap();
-    eprintln!("{} tiles, {} entries", tiles.len(), tiles.iter().map(|t| t.rows.len()).sum::<usize>());
+    eprintln!("{} tiles, {} entries, a window of {} with the word at {}", tiles.len(), tiles.iter().map(|t| t.rows.len()).sum::<usize>(), win(), half());
 }
 
 fn load_tiles(path: &str) -> TileIndex {
@@ -1006,7 +1027,9 @@ fn load_tiles(path: &str) -> TileIndex {
     f.read_exact(bytes_of_mut(&mut h)).unwrap();
     let shape = Shape::from_header(h[0]);
     let space = 20usize.pow(shape.k() as u32);
-    let tiles = (0..h[1]).map(|_| {
+    let (n, len, half) = (h[1] & 0xffff_ffff, (h[1] >> 32) as usize & 0xffff, (h[1] >> 48) as usize);
+    set_window(if len == 0 { DEFAULT_WINDOW } else { (len, half) });
+    let tiles = (0..n).map(|_| {
         let mut t = [0u64; 3];
         f.read_exact(bytes_of_mut(&mut t)).unwrap();
         let mut starts = vec![0u32; space + 1];
@@ -1083,7 +1106,7 @@ fn postings(orfs: &[&[u8]], shape: Shape) -> Postings {
         let mut i = 0;
         for j in 0..(f.len() + 1).saturating_sub(span) {
             if let Some(c) = code_at(f, j) {
-                out[i] = (c as u32, HALF.saturating_sub(j) as u8, (HALF + f.len() - j).min(WIN) as u8, o as u32, j as u32);
+                out[i] = (c as u32, half().saturating_sub(j) as u8, (half() + f.len() - j).min(win()) as u8, o as u32, j as u32);
                 i += 1;
             }
         }
@@ -1103,10 +1126,10 @@ fn postings(orfs: &[&[u8]], shape: Shape) -> Postings {
     for c in 0..space {
         group_code[gstarts[c] as usize..gstarts[c + 1] as usize].fill(c as u32);
     }
-    let (mut windows, mut orf, mut pos) = (vec![OUTSIDE + BIAS; groups * WIN * LANES], vec![u32::MAX; groups * LANES], vec![0u32; groups * LANES]);
-    let (mut covered, mut span) = (vec![0u64; groups], vec![(WIN as u8, 0u8); groups]);
+    let (mut windows, mut orf, mut pos) = (vec![OUTSIDE + BIAS; groups * win() * LANES], vec![u32::MAX; groups * LANES], vec![0u32; groups * LANES]);
+    let (mut covered, mut span) = (vec![0u64; groups], vec![(win() as u8, 0u8); groups]);
     windows
-        .par_chunks_mut(WIN * LANES)
+        .par_chunks_mut(win() * LANES)
         .zip(orf.par_chunks_mut(LANES))
         .zip(pos.par_chunks_mut(LANES))
         .zip(covered.par_iter_mut())
@@ -1123,9 +1146,9 @@ fn postings(orfs: &[&[u8]], shape: Shape) -> Postings {
                 let f = orfs[o as usize];
                 let j = j as usize;
                 // the window holds the whole ORF, so its score is the whole diagonal's
-                *covered |= (((j <= HALF && f.len() <= j + WIN - HALF) as u64) * LANE) << (LANE_BITS * lane);
+                *covered |= (((j <= half() && f.len() <= j + win() - half()) as u64) * LANE) << (LANE_BITS * lane);
                 for x in start as usize..end as usize {
-                    w[x * LANES + lane] = f[j + x - HALF] + BIAS;
+                    w[x * LANES + lane] = f[j + x - half()] + BIAS;
                 }
             }
         });
@@ -1178,7 +1201,7 @@ fn score4_neon(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize
 fn score4_neon_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::aarch64::*;
     for i in 0..4 {
-        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+        assert!((rows[i] + span.1) * STRIDE <= prof.len() && w[i].len() >= span.1 * LANES);
     }
     unsafe {
         let (mut cur, mut best) = ([vdupq_n_s8(i8::MIN); 4], [vdupq_n_s8(i8::MIN); 4]);
@@ -1210,7 +1233,7 @@ fn score4_neon_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 
 unsafe fn score4_sse41_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::x86_64::*;
     for i in 0..4 {
-        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+        assert!((rows[i] + span.1) * STRIDE <= prof.len() && w[i].len() >= span.1 * LANES);
     }
     let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
     let flip = _mm_set1_epi8(i8::MIN);
@@ -1258,7 +1281,7 @@ fn score4_sse41(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usiz
 unsafe fn score4_avx2_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::x86_64::*;
     for i in 0..4 {
-        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+        assert!((rows[i] + span.1) * STRIDE <= prof.len() && w[i].len() >= span.1 * LANES);
     }
     let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
     let flip = _mm256_set1_epi8(i8::MIN);
@@ -1302,7 +1325,7 @@ fn score4_avx2(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize
 unsafe fn score4_avx512_inner<const ONE: bool>(prof: &[i8], rows: [usize; 4], w: [&[u8]; 4], span: (usize, usize), gates: (i8, i8), masks: &mut Masks) {
     use std::arch::x86_64::*;
     for i in 0..4 {
-        assert!((rows[i] + WIN) * STRIDE <= prof.len() && w[i].len() >= WIN * LANES);
+        assert!((rows[i] + span.1) * STRIDE <= prof.len() && w[i].len() >= span.1 * LANES);
     }
     let p = rows.map(|r| prof.as_ptr().add(r * STRIDE));
     let (zero, unbias) = (_mm256_set1_epi8(i8::MIN), _mm256_set1_epi8(16));
@@ -1362,16 +1385,16 @@ fn scorer4() -> (&'static str, Scorer4) {
     }
 }
 
-/// A model's profile in quarter bits, int8, STRIDE bytes per column, with HALF columns of padding before
-/// and WIN - HALF after; padding and OUTSIDE score i8::MIN, which resets a local score.
+/// A model's profile in quarter bits, int8, STRIDE bytes per column, with half() columns of padding before
+/// and win() - half() after (the window's); padding and OUTSIDE score i8::MIN, which resets a local score.
 fn int8_profile(pf: &Pfam, m: usize, out: &mut Vec<i8>) {
     let (a, b) = (pf.offs[m] as usize, pf.offs[m + 1] as usize);
     let at = out.len();
-    out.resize(at + (b - a + WIN) * STRIDE, i8::MIN);
+    out.resize(at + (b - a + win()) * STRIDE, i8::MIN);
     let out = &mut out[at..];
     for c in 0..b - a {
         for r in 0..21 {
-            out[(c + HALF) * STRIDE + r] = (pf.lo[(a + c) * 21 + r] * 4.0).round().clamp(-127.0, 127.0) as i8;
+            out[(c + half()) * STRIDE + r] = (pf.lo[(a + c) * 21 + r] * 4.0).round().clamp(-127.0, 127.0) as i8;
         }
     }
 }
@@ -1485,6 +1508,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     // FILTER_GAPPED_WINDOW=w: the gapped stage sees only the read's residues from w before the diagonal's best ungapped
     // segment to w after it, not the whole stretch of the diagonal that meets the model
     let window: Option<usize> = std::env::var("FILTER_GAPPED_WINDOW").ok().map(|v| v.parse().unwrap());
+    let win = win();
     // FILTER_DIAG_WINDOW=w: the whole-diagonal score on the read's residues from w before the diagonal's first k-mer
     // that passed the gate to w after its last, not on the whole stretch of the diagonal that meets the model
     let diag_window: Option<usize> = std::env::var("FILTER_DIAG_WINDOW").ok().map(|v| v.parse().unwrap());
@@ -1531,7 +1555,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 let mut jobs = [(0usize, 0usize); 4];
                 let mut queued = 0usize;
                 let mut masks: Masks = [(0, 0); 4];
-                let mut span = (WIN, 0usize);
+                let mut span = (win, 0usize);
                 let mut compact_at = SURV_COMPACT;
                 let mut drain = |jobs: &[(usize, usize)], masks: &Masks, surv: &mut Vec<u128>| {
                     for (i, &(row, g)) in jobs.iter().enumerate() {
@@ -1572,7 +1596,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                     for four in rows[..whole].chunks_exact(4) {
                         let four = [four[0] as usize, four[1] as usize, four[2] as usize, four[3] as usize];
                         for g in g0..g1 {
-                            let w = &p.windows[g * WIN * LANES..(g + 1) * WIN * LANES];
+                            let w = &p.windows[g * win * LANES..(g + 1) * win * LANES];
                             score4(prof, four, [w; 4], (p.span[g].0 as usize, p.span[g].1 as usize), (gate, covered_gate), &mut masks);
                             // two batches in three have no survivor
                             if masks.iter().fold(0, |any, m| any | m.0) != 0 {
@@ -1586,11 +1610,11 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             queued += 1;
                             span = (span.0.min(p.span[g].0 as usize), span.1.max(p.span[g].1 as usize));
                             if queued == 4 {
-                                let w = jobs.map(|(_, g)| &p.windows[g * WIN * LANES..(g + 1) * WIN * LANES]);
+                                let w = jobs.map(|(_, g)| &p.windows[g * win * LANES..(g + 1) * win * LANES]);
                                 score4(prof, jobs.map(|(r, _)| r), w, span, (gate, covered_gate), &mut masks);
                                 drain(&jobs, &masks, surv);
                                 queued = 0;
-                                span = (WIN, 0);
+                                span = (win, 0);
                             }
                         }
                     }
@@ -1600,7 +1624,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                     for j in queued..4 {
                         jobs[j] = jobs[0];
                     }
-                    let w = jobs.map(|(_, g)| &p.windows[g * WIN * LANES..(g + 1) * WIN * LANES]);
+                    let w = jobs.map(|(_, g)| &p.windows[g * win * LANES..(g + 1) * win * LANES]);
                     score4(prof, jobs.map(|(r, _)| r), w, span, (gate, covered_gate), &mut masks);
                 }
                 drain(&jobs[..queued], &masks, surv);
@@ -1989,14 +2013,14 @@ mod tests {
         let mut x = 99u64;
         let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
         // scores up to 60 a column, so some lanes saturate
-        let prof: Vec<i8> = (0..3 * WIN * STRIDE).map(|i| if i % STRIDE > 20 { i8::MIN } else { (next() % 90) as i8 - 30 }).collect();
+        let prof: Vec<i8> = (0..3 * win() * STRIDE).map(|i| if i % STRIDE > 20 { i8::MIN } else { (next() % 90) as i8 - 30 }).collect();
         for t in 0..400 {
             // residues and padding, or only well-scoring ones
-            let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..WIN * LANES).map(|_| (next() % 22) as u8 + BIAS).collect()).collect();
+            let ws: Vec<Vec<u8>> = (0..4).map(|_| (0..win() * LANES).map(|_| (next() % 22) as u8 + BIAS).collect()).collect();
             // four groups, or one for all four jobs
             let w = [0, 1, 2, 3].map(|i| &ws[if t % 2 == 0 { i } else { 0 }][..]);
-            let rows = [0, 1, 2, 3].map(|_| (next() % (2 * WIN as u64)) as usize);
-            let (span, gates) = (((next() % 10) as usize, WIN - (next() % 10) as usize), ([66, 10, 127, 0][t / 2 % 4], [68, 127, 100, 40][t / 2 % 4]));
+            let rows = [0, 1, 2, 3].map(|_| (next() % (2 * win() as u64)) as usize);
+            let (span, gates) = (((next() % 10) as usize, win() - (next() % 10) as usize), ([66, 10, 127, 0][t / 2 % 4], [68, 127, 100, 40][t / 2 % 4]));
             let mut want: Masks = [(0, 0); 4];
             score4_scalar(&prof, rows, w, span, gates, &mut want);
             for (name, kernel) in scorers() {
@@ -2032,10 +2056,10 @@ mod tests {
         let mut prof = vec![];
         int8_profile(&pf, 0, &mut prof);
         let at = (0..p.orf.len()).find(|&l| p.orf[l] == 0 && p.pos[l] == 0).unwrap();
-        let w = &p.windows[at / LANES * WIN * LANES..][..WIN * LANES];
+        let w = &p.windows[at / LANES * win() * LANES..][..win() * LANES];
         for (name, kernel) in scorers() {
             let mut got: Masks = [(0, 0); 4];
-            kernel(&prof, [0; 4], [w; 4], (0, WIN), (98, 99), &mut got);
+            kernel(&prof, [0; 4], [w; 4], (0, win()), (98, 99), &mut got);
             let lane = LANE << (LANE_BITS * (at % LANES));
             assert!(got[0].0 & lane != 0 && got[0].1 & lane == 0, "{name}");
         }

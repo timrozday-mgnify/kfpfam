@@ -462,3 +462,8 @@ tiles, the same proteins; total is filter and HMMER (`--forward-slack 8`), CPU-s
   Without it the bound would see every survivor, and int8 rounding alone moved 5% of pairs across the bar before.
 - So two stages stay, with a narrower gate as a choice: `top` 32 is 0.88× its CPU for 3 pairs (0.03%), 24 is 0.81× for 5.
   `WIN` is a constant of the postings' layout and the tiles: as an option it would need the tiles built for it.
+
+`FILTER_WINDOW=len:half` at `filter tile` now sets the gate's window (default 48:22, as before); the tiles carry it and `join`
+reads it from them, so one binary serves both. A 32:12 index gives the pairs of a build with `WIN` 32, byte for byte, and a
+default one those of before. `top` in hmm-annotate is 32:12 with `FILTER_DIAG_WINDOW=8` and `FILTER_GAPPED_WINDOW=64`
+(on 50-residue pieces too, 0 of 11,835 pairs lost, 22.1 → 18.5 CPU-s for the filter).
