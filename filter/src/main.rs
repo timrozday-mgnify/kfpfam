@@ -1409,6 +1409,26 @@ const MAX_BLOCK: usize = 1 << (48 - KEY_BITS); // ORFs
 fn pack(model: u32, orf: u32, column: u32, pos: u32) -> u64 {
     (model as u64) << 48 | (orf as u64) << KEY_BITS | (column + KEY_OFFSET - pos) as u64
 }
+/// Survivors sorted, and each diagonal's held as its first and last k-mer: a survivor is its key << 32 | read position.
+fn compact(surv: &mut Vec<u128>) {
+    surv.sort_unstable();
+    let (mut kept, mut i) = (0, 0);
+    while i < surv.len() {
+        let mut j = i;
+        while j + 1 < surv.len() && surv[j + 1] >> 32 == surv[i] >> 32 {
+            j += 1;
+        }
+        surv[kept] = surv[i];
+        kept += 1;
+        if j > i {
+            surv[kept] = surv[j];
+            kept += 1;
+        }
+        i = j + 1;
+    }
+    surv.truncate(kept);
+}
+
 /// Model, ORF, column less position.
 fn unpack(x: u64) -> (u32, u32, i64) {
     ((x >> 48) as u32, (x >> KEY_BITS) as u32 & (MAX_BLOCK as u32 - 1), (x & (2 * KEY_OFFSET as u64 - 1)) as i64 - KEY_OFFSET as i64)
@@ -1465,6 +1485,10 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     // FILTER_GAPPED_WINDOW=w: the gapped stage sees only the read's residues from w before the diagonal's best ungapped
     // segment to w after it, not the whole stretch of the diagonal that meets the model
     let window: Option<usize> = std::env::var("FILTER_GAPPED_WINDOW").ok().map(|v| v.parse().unwrap());
+    // FILTER_DIAG_WINDOW=w: the whole-diagonal score on the read's residues from w before the diagonal's first k-mer
+    // that passed the gate to w after its last, not on the whole stretch of the diagonal that meets the model
+    let diag_window: Option<usize> = std::env::var("FILTER_DIAG_WINDOW").ok().map(|v| v.parse().unwrap());
+    let word_span = ti.shape.span();
     let (mut t_post, mut t_join) = (0.0f64, 0.0f64);
     // FILTER_BINARY=1: per block its ORFs, residues and bytes of pairs (u64), then the pairs, (ORF in the block, model) as
     // two u32 in model order, little endian. For a reader that streams the same FASTA beside it: 8 bytes a pair, not 60
@@ -1491,7 +1515,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
         // text, not its pairs
         let rows: Vec<Vec<u8>> = ti.tiles
             .par_iter()
-            .map_init(|| (Vec::<i8>::new(), Vec::<u64>::new(), vec![], vec![]), |(prof, surv, h, del), tile| {
+            .map_init(|| (Vec::<i8>::new(), Vec::<u128>::new(), vec![], vec![]), |(prof, surv, h, del), tile| {
                 let base = tile_bases(pf, tile.m0, tile.m1);
                 prof.clear();
                 for m in tile.m0..tile.m1 {
@@ -1509,7 +1533,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 let mut masks: Masks = [(0, 0); 4];
                 let mut span = (WIN, 0usize);
                 let mut compact_at = SURV_COMPACT;
-                let mut drain = |jobs: &[(usize, usize)], masks: &Masks, surv: &mut Vec<u64>| {
+                let mut drain = |jobs: &[(usize, usize)], masks: &Masks, surv: &mut Vec<u128>| {
                     for (i, &(row, g)) in jobs.iter().enumerate() {
                         // lanes that pass: the gate, or for a window holding its whole ORF the bar less
                         // SLACK, as that window already scores the whole diagonal to within rounding
@@ -1524,14 +1548,13 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             let lane = mask.trailing_zeros() as usize / LANE_BITS;
                             mask &= !(LANE << (LANE_BITS * lane));
                             let q = g * LANES + lane;
-                            surv.push(pack(m, p.orf[q], c as u32, p.pos[q]));
+                            surv.push((pack(m, p.orf[q], c as u32, p.pos[q]) as u128) << 32 | p.pos[q] as u128);
                         }
                     }
                     // a diagonal survives once per k-mer on it: compact before the list grows large. Again only when it
                     // has doubled, or a tile with more than SURV_COMPACT unique diagonals sorts them at every batch
                     if surv.len() > compact_at {
-                        surv.sort_unstable();
-                        surv.dedup();
+                        compact(surv);
                         compact_at = SURV_COMPACT.max(2 * surv.len());
                     }
                 };
@@ -1584,14 +1607,24 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 hits.fetch_add(n_hits, Relaxed);
                 survivors.fetch_add(surv.len() as u64, Relaxed);
                 let ts = Instant::now();
-                surv.sort_unstable();
-                surv.dedup();
+                compact(surv);
                 sort_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
-                unique.fetch_add(surv.len() as u64, Relaxed);
                 let mut res: Vec<(u32, u32, f32, i64, (u32, u32))> = vec![];
-                for &x in surv.iter() {
+                let mut at = 0;
+                let mut n_diag = 0u64;
+                while at < surv.len() {
+                    // a diagonal's first and last k-mer, or its only one
+                    let x = (surv[at] >> 32) as u64;
+                    let last = if at + 1 < surv.len() && (surv[at + 1] >> 32) as u64 == x { at + 1 } else { at };
+                    let (first_pos, last_pos) = (surv[at] as u32 as usize, surv[last] as u32 as usize);
+                    at = last + 1;
+                    n_diag += 1;
                     let (m, o, d) = unpack(x); // d: column - position
-                    let f = chunk[o as usize];
+                    let whole = chunk[o as usize];
+                    // the read's residues the diagonal is scored on: all, or a window round its k-mers
+                    let from = diag_window.map_or(0, |w| first_pos.saturating_sub(w));
+                    let to = diag_window.map_or(whole.len(), |w| (last_pos + word_span + w).min(whole.len()));
+                    let (f, d) = (&whole[from..to], d + from as i64);
                     let cols = (pf.offs[m as usize + 1] - pf.offs[m as usize]) as usize;
                     // a point on the diagonal inside both the read and the model
                     let j = if d >= 0 { 0usize } else { (-d) as usize };
@@ -1600,6 +1633,8 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         continue;
                     }
                     let (s, lo, hi) = diagonal_segment(pf, m as usize, col, f, j);
+                    // back to the whole read
+                    let (lo, hi, d, f) = (lo + from, hi + from, d - from as i64, whole);
                     // the residues the gapped stage sees: all of them, or a window round the best segment
                     let part = window.map_or((0, f.len() as u32), |w| (lo.saturating_sub(w) as u32, (hi + w).min(f.len()) as u32));
                     if s >= bar {
@@ -1613,6 +1648,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         }
                     }
                 }
+                unique.fetch_add(n_diag, Relaxed);
                 surv_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
                 let ts = Instant::now();
                 use std::io::Write;

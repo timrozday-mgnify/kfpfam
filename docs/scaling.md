@@ -389,3 +389,33 @@ that lose recall faster than they save, and barely change HMMER's work (its pair
 rises). The gate's figures vary by about 3 s between runs of the same work, so read differences under that as noise.
 What is left of `top`'s gap to the pieces is the whole-diagonal stage (19 s at 431 ns a diagonal), which a window
 would need the k-mer's position for: survivors keep only (model, protein, diagonal).
+
+### A window for the whole-diagonal stage too (2026-11-26)
+
+Survivors now keep the read position of each diagonal's first and last k-mer through the gate (a u128 per survivor, compacted
+to at most two a diagonal; the pairs written are byte for byte the same, and sorting `top`'s survivors takes 1.4 CPU-s against
+0.6). `FILTER_DIAG_WINDOW=w` scores the diagonal on the read from w before the first to w after the last, not on the whole
+stretch that meets the model; its best segment then places `FILTER_GAPPED_WINDOW`. Same proteins and models as above; HMMER with
+`--forward-slack 8`; pairs missed of 8,723:
+
+| mode | diagonal window | gapped window | diagonal stage | pairs at the bar | gapped bound + exact | filter | HMMER | missed |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `top` | whole | whole | 18.9 | 29.6 M | 49.4 | 86.5 | 41.6 | 0 |
+| `top` | whole | 64 | 18.9 | 29.6 M | 29.4 | 66.5 | 41.5 | 0 |
+| `top` | 32 | 64 | 8.1 | 29.5 M | 29.0 | 55.4 | 41.4 | 0 |
+| `top` | 16 | 64 | 5.7 | 26.8 M | 25.7 | 49.5 | 40.2 | 0 |
+| **`top`** | **8** | **64** | 4.3 | 20.4 M | 19.1 | **41.5** | **37.1** | **0** |
+| `top` | 8 | 32 | 4.4 | 20.4 M | 12.2 | 34.7 | 36.2 | 4 |
+| `top` | 4 | 64 | 3.6 | 16.0 M | 15.0 | 36.6 | 34.6 | 4 |
+| `top` | 0 | 64 | 2.4 | 9.8 M | 9.7 | 30.0 | 31.1 | 13 |
+| `fast` | whole | whole | 1.8 | 3.27 M | 5.0 | 10.9 | 9.4 | 69 |
+| `fast` | 32 | whole | 0.8 | 3.26 M | 5.0 | 9.9 | 9.4 | 69 |
+| `fast` | 32 | 64 | 0.8 | 3.26 M | 2.9 | 7.8 | 9.4 | 77 |
+| `fast` | 16 | 64 | 0.6 | 2.82 M | 2.4 | 7.1 | 9.2 | 102 |
+
+The diagonal window does two things: each diagonal costs less (428 → 98 ns at 8), and a score over a stretch near the k-mers is a
+sharper test than one over the whole diagonal, which can collect chance segments far away, so fewer pairs reach the bar
+(29.6 → 20.4 M) and every later stage, HMMER included, has less to do. `top` at 8 and 64 is 0.61× its CPU with filter and HMMER
+together, 128 → 79 CPU-s, with no pair lost; on these proteins that is 2.3× `hmmsearch` (179) where it was 1.4×. `fast`'s
+diagonals were cheap already: 32 and whole is free (69 lost, as before), 32 and 64 saves a little more for 8 pairs.
+What is left of `top`'s filter is the window gate itself, 17-18 CPU-s of 41.5.
