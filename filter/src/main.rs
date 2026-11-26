@@ -1376,20 +1376,29 @@ fn int8_profile(pf: &Pfam, m: usize, out: &mut Vec<i8>) {
     }
 }
 
-/// Whole-diagonal ungapped score in bits, as search computes it, for read position j at model column col.
-fn diagonal(pf: &Pfam, m: usize, col: usize, f: &[u8], j: usize) -> f32 {
+/// Whole-diagonal ungapped score in bits, as search computes it, for read position j at model column col, and
+/// where its best segment is in the read: (score, first, last + 1).
+fn diagonal_segment(pf: &Pfam, m: usize, col: usize, f: &[u8], j: usize) -> (f32, usize, usize) {
     let a = pf.offs[m] as usize;
     let cols = pf.offs[m + 1] as usize - a;
     let back = j.min(col);
     let len = (f.len() - j + back).min(cols - col + back);
     let mut at = (a + col - back) * 21;
     let (mut cur, mut best) = (0.0f32, 0.0f32);
-    for &r in &f[j - back..j - back + len] {
-        cur = fmax(cur + pf.lo[at + r as usize], 0.0);
-        best = fmax(best, cur);
+    let (mut from, mut seg) = (j - back, (j - back, j - back));
+    for (i, &r) in f[j - back..j - back + len].iter().enumerate() {
+        let i = j - back + i;
+        cur += pf.lo[at + r as usize];
+        if cur <= 0.0 {
+            cur = 0.0;
+            from = i + 1;
+        } else if cur > best {
+            best = cur;
+            seg = (from, i + 1);
+        }
         at += 21;
     }
-    best
+    (best, seg.0, seg.1)
 }
 
 // A survivor is model << 48 | ORF << 24 | diagonal key, so it sorts as one integer. The key is column less read position,
@@ -1452,6 +1461,10 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     let (engine, score4) = scorer4();
     let (hits, survivors, pairs_n) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let (surv_ns, unique, gap_ns) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)); // surv: sort, dedupe and exact diagonals
+    let (sort_ns, bound_ns, exact_ns) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)); // parts of surv and gapped
+    // FILTER_GAPPED_WINDOW=w: the gapped stage sees only the read's residues from w before the diagonal's best ungapped
+    // segment to w after it, not the whole stretch of the diagonal that meets the model
+    let window: Option<usize> = std::env::var("FILTER_GAPPED_WINDOW").ok().map(|v| v.parse().unwrap());
     let (mut t_post, mut t_join) = (0.0f64, 0.0f64);
     // FILTER_BINARY=1: per block its ORFs, residues and bytes of pairs (u64), then the pairs, (ORF in the block, model) as
     // two u32 in model order, little endian. For a reader that streams the same FASTA beside it: 8 bytes a pair, not 60
@@ -1573,8 +1586,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                 let ts = Instant::now();
                 surv.sort_unstable();
                 surv.dedup();
+                sort_ns.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
                 unique.fetch_add(surv.len() as u64, Relaxed);
-                let mut res: Vec<(u32, u32, f32, i64)> = vec![];
+                let mut res: Vec<(u32, u32, f32, i64, (u32, u32))> = vec![];
                 for &x in surv.iter() {
                     let (m, o, d) = unpack(x); // d: column - position
                     let f = chunk[o as usize];
@@ -1585,15 +1599,17 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                     if j >= f.len() || col >= cols {
                         continue;
                     }
-                    let s = diagonal(pf, m as usize, col, f, j);
+                    let (s, lo, hi) = diagonal_segment(pf, m as usize, col, f, j);
+                    // the residues the gapped stage sees: all of them, or a window round the best segment
+                    let part = window.map_or((0, f.len() as u32), |w| (lo.saturating_sub(w) as u32, (hi + w).min(f.len()) as u32));
                     if s >= bar {
                         match res.last_mut() {
                             Some(x) if !all_diagonals && x.0 == o && x.1 == m => {
                                 if s > x.2 {
-                                    (x.2, x.3) = (s, d);
+                                    (x.2, x.3, x.4) = (s, d, part);
                                 }
                             }
-                            _ => res.push((o, m, s, d)),
+                            _ => res.push((o, m, s, d, part)),
                         }
                     }
                 }
@@ -1613,19 +1629,25 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                         writeln!(text, "{}\t{m}\t{d:.2}\t{g:.2}", orfs.name(o as usize)).unwrap();
                     }
                 };
+                // a read's part, and the diagonal in its numbering
+                let part = |o: u32, diag: i64, (lo, hi): (u32, u32)| (&chunk[o as usize][lo as usize..hi as usize], diag + lo as i64);
                 for four in res.chunks(PAIRS) {
+                    let tb = Instant::now();
                     let reach = bound.as_ref().map_or([true; PAIRS], |b| {
                         // a short last chunk repeats its first pair
                         b.may_reach(std::array::from_fn(|i| {
-                            let &(o, m, _, diag) = four.get(i).unwrap_or(&four[0]);
-                            (m as usize, chunk[o as usize], diag)
+                            let &(o, m, _, diag, p) = four.get(i).unwrap_or(&four[0]);
+                            let (f, diag) = part(o, diag, p);
+                            (m as usize, f, diag)
                         }))
                     });
-                    for (&(o, m, d, diag), _) in four.iter().zip(reach).filter(|(_, r)| *r) {
+                    bound_ns.fetch_add(tb.elapsed().as_nanos() as u64, Relaxed);
+                    let te = Instant::now();
+                    for (&(o, m, d, diag, p), _) in four.iter().zip(reach).filter(|(_, r)| *r) {
                         if first_only && pending.is_some_and(|p| p.0 == o && p.1 == m) {
                             continue;
                         }
-                        let f = chunk[o as usize];
+                        let (f, diag) = part(o, diag, p);
                         n += 1;
                         let a = pf.offs[m as usize] as usize;
                         let cols = pf.offs[m as usize + 1] as usize - a;
@@ -1640,6 +1662,7 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
                             }
                         }
                     }
+                    exact_ns.fetch_add(te.elapsed().as_nanos() as u64, Relaxed);
                 }
                 write(&mut text, pending);
                 bounded.fetch_add(n, Relaxed);
@@ -1666,6 +1689,9 @@ fn join(pf: &Pfam, ti: &TileIndex, path: &str, bar: f32, gate_bits: f32, block: 
     let wall = t0.elapsed().as_secs_f64();
     let h = hits.load(Relaxed) as f64;
     let (surv_s, gap_s) = (surv_ns.load(Relaxed) as f64 / 1e9, gap_ns.load(Relaxed) as f64 / 1e9);
+    let [sort_s, bound_s, exact_s] = [&sort_ns, &bound_ns, &exact_ns].map(|x| x.load(Relaxed) as f64 / 1e9);
+    eprintln!("stages, core-s: window gate (join less survivors) {:.2}, survivors sorted {sort_s:.2}, whole diagonals {:.2}, gapped bound {bound_s:.2}, gapped exact {exact_s:.2}, writing {:.2}",
+        t_join * threads - gap_s - surv_s, surv_s - sort_s, gap_s - bound_s - exact_s);
     let join_s = t_join * threads - gap_s; // the survivor stage is part of it, and so is waiting for the last tile
     eprintln!(
         "{engine}: {} ORFs, {:.1}s wall on {threads} threads, {:.0} core-s; postings {:.1} s wall, join {:.1} core-s, gapped {:.1} core-s; \

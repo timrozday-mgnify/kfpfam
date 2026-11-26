@@ -349,3 +349,43 @@ Pfam models, 50,000 reversed MGnify proteins of 165 residues). On V3's ORFs it m
 
 **`FILTER_DIAGONALS=any`** writes the pairs `all` does, and leaves a pair at the first diagonal that reaches its bar: 188,485 scored in full against 336,092 on
 proteins that hold many true pairs. Its scores are that diagonal's, not the pair's best.
+
+## Whole proteins: where the time goes, and a window for the gapped stage (2026-11-26)
+
+24,000 MGnify proteins (6.2 M residues, median 191) and the same residues cut into pieces, 7,534 Pfam 38.2 models
+(every fourth), M4 Pro, 4 threads, band 15, `any`. The new stage timers (`stages, core-s:` in the log) split the join.
+Candidates in, CPU-s, and cost per candidate; `fast` (θ 5, bar 18, gate 17.5, gapped 10 under each model's weakest
+domain):
+
+| stage | 50-residue pieces | whole proteins | per candidate |
+| --- | --- | --- | --- |
+| window gate (k-mer hits) | 2.40 G, 3.3 s | 2.75 G, 4.2 s | 1.37 → 1.53 ns |
+| whole diagonal (unique diagonals) | 3.20 M, 0.5 s | 4.74 M, 1.8 s | 163 → 370 ns |
+| gapped bound (pairs at the bar) | 2.13 M, 0.5 s | 3.27 M, 3.6 s | 0.24 → 1.11 µs |
+| gapped exact (past the bound) | 95 k, 0.1 s | 274 k, 1.3 s | 1.4 → 4.6 µs |
+| HMMER (pairs written) | 43.9 k, 2.4 s | 53.6 k, 9.2 s | 56 → 171 µs |
+
+`top` (θ 9, bar 15, gate 14.5, gapped 21.25): gate 9.7 → 11.2 G hits, 12.2 → 21.8 s; diagonals 31 → 44 M, 4.8 → 19.1 s
+(154 → 431 ns); bound 20 → 30 M pairs, 4.9 → 33.5 s (0.24 → 1.13 µs); exact 1.0 → 2.7 M, 1.5 → 15.6 s; HMMER 0.45 → 1.02 M
+pairs, 7.1 → 41.4 s. So it is mostly the cost per candidate that grows, roughly with the stretch scored (the whole
+diagonal, then the band over the model's length), and only partly the count (1.2-1.5×, the exact stage 2.6-2.9×).
+The gate's per-hit cost hardly moves.
+
+`FILTER_GAPPED_WINDOW=w` (off by default; the same pairs as before without it) gives the bound and the exact score only
+the residues from w before the diagonal's best ungapped segment to w after it. Whole proteins, pairs missed of 8,723
+that `hmmsearch` passes (HMMER with `--forward-slack 8`):
+
+| w | `fast` filter CPU-s | pairs to HMMER | missed | `top` filter CPU-s | pairs to HMMER | missed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| whole diagonal | 10.6 | 53,567 | 69 | 85.1 | 1,019,878 | 0 |
+| 64 | 8.8 | 51,678 | 77 | 65.2 | 1,006,323 | 0 |
+| 32 | 7.8 | 47,710 | 122 | 55.8 | 949,650 | 4 |
+| 16 | 7.2 | 42,827 | 225 | 49.7 | 847,505 | 24 |
+| 8 | 6.9 | 39,140 | 356 | 46.2 | 765,576 | 40 |
+| 0 | 6.6 | 36,214 | 577 | 43.0 | 715,172 | 47 |
+
+At 64 `top` loses nothing and its filter takes 0.77× the time; `fast` pays 8 pairs for 0.83×. Windows narrower than
+that lose recall faster than they save, and barely change HMMER's work (its pairs fall less than its cost per pair
+rises). The gate's figures vary by about 3 s between runs of the same work, so read differences under that as noise.
+What is left of `top`'s gap to the pieces is the whole-diagonal stage (19 s at 431 ns a diagonal), which a window
+would need the k-mer's position for: survivors keep only (model, protein, diagonal).
